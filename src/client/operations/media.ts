@@ -3,7 +3,6 @@
  * Handles all media-related WordPress REST API operations
  */
 
-import FormData from "form-data";
 import { promises as fsPromises } from "fs";
 import * as path from "path";
 import type { WordPressMedia, MediaQueryParams, UploadMediaRequest, UpdateMediaRequest } from "@/types/wordpress.js";
@@ -61,7 +60,10 @@ export class MediaOperations {
 
     try {
       const stats = await fileHandle.stat();
-      const filename = data.title || path.basename(data.file_path);
+      // Always derive the upload filename from the file path. Using data.title
+      // here (Bud fix) produced wrong filenames/extensions when a human-readable
+      // title was set; the title is still applied as media metadata below.
+      const filename = path.basename(data.file_path);
 
       // Check if file is too large (WordPress default is 2MB for most installs)
       const maxSize = 10 * 1024 * 1024; // 10MB reasonable limit
@@ -96,34 +98,34 @@ export class MediaOperations {
   ): Promise<WordPressMedia> {
     log.debug(`Uploading file: ${filename} (${fileData.length} bytes)`);
 
-    // Use FormData but with correct configuration for node-fetch
-    const formData = new FormData();
-    formData.setMaxListeners(20);
-
-    // Add file with correct options
-    formData.append("file", fileData, {
-      filename,
-      contentType: mimeType,
-    });
-
-    // Add metadata
-    if (meta.title) formData.append("title", meta.title);
-    if (meta.alt_text) formData.append("alt_text", meta.alt_text);
-    if (meta.caption) formData.append("caption", meta.caption);
-    if (meta.description) formData.append("description", meta.description);
-    if (meta.post) formData.append("post", meta.post.toString());
-
-    // Use longer timeout for file uploads
+    // Bud fix (carried from local dist patch — see project_wordpress_mcp memory):
+    // Node's native fetch (undici) does not consume the `form-data` package's Node
+    // stream, so the multipart body was dropped and the default application/json
+    // Content-Type leaked through — WordPress rejected it as "Invalid JSON body
+    // passed". Send the raw binary with a Content-Disposition header (the WP REST
+    // media endpoint accepts this), then apply any metadata via a follow-up update.
     const uploadTimeout = options?.timeout !== undefined ? options.timeout : 600000; // 10 minutes default
-    const uploadOptions: RequestOptions = {
+    const created = await this.client.post<WordPressMedia>("media", fileData, {
       ...options,
       timeout: uploadTimeout,
-    };
+      headers: {
+        ...options?.headers,
+        "Content-Type": mimeType,
+        "Content-Disposition": `attachment; filename="${filename}"`,
+      },
+    });
 
-    log.debug(`Upload prepared with FormData, timeout: ${uploadTimeout}ms`);
+    const metaUpdate: Record<string, unknown> = {};
+    if (meta.title) metaUpdate.title = meta.title;
+    if (meta.alt_text) metaUpdate.alt_text = meta.alt_text;
+    if (meta.caption) metaUpdate.caption = meta.caption;
+    if (meta.description) metaUpdate.description = meta.description;
+    if (meta.post) metaUpdate.post = meta.post;
 
-    // Use the regular post method which handles FormData correctly
-    return this.client.post<WordPressMedia>("media", formData, uploadOptions);
+    if (created && created.id && Object.keys(metaUpdate).length > 0) {
+      return this.client.put<WordPressMedia>(`media/${created.id}`, metaUpdate);
+    }
+    return created;
   }
 
   /**

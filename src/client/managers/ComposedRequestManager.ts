@@ -250,8 +250,18 @@ export class ComposedRequestManager implements RequestHandler {
     };
 
     if (data && (method === "POST" || method === "PUT" || method === "PATCH")) {
-      assertNoMojibake(data, "request body");
-      requestOptions.body = JSON.stringify(data);
+      // Bud fix: pass raw binary (Buffer) bodies through with the caller's
+      // Content-Type intact (e.g. media uploads) rather than JSON.stringify-ing
+      // them — mirrors the guard in RequestManager so the media upload fix
+      // survives if this manager ever becomes the active request path.
+      if (Buffer.isBuffer(data)) {
+        requestOptions.body = data;
+      } else if (typeof data === "string") {
+        requestOptions.body = data;
+      } else {
+        assertNoMojibake(data, "request body");
+        requestOptions.body = JSON.stringify(data);
+      }
     }
 
     return requestOptions;
