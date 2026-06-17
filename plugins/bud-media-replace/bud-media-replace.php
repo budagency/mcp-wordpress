@@ -2,8 +2,8 @@
 /**
  * Plugin Name: Bud Media Replace
  * Plugin URI:  https://bud.agency
- * Description: Headless REST route to replace a media attachment's binary in place, keeping the same attachment ID, filename, and all existing URLs. Requires PHP 8.0+.
- * Version:     1.1.0
+ * Description: Headless REST route to replace a media attachment's binary in place, keeping the same attachment ID, filename, and all existing URLs. Images and PDFs only. Requires PHP 8.0+.
+ * Version:     1.4.0
  * Author:      Bud Agency
  * Author URI:  https://bud.agency
  * License:     GPL-2.0-or-later
@@ -38,45 +38,21 @@ add_action('rest_api_init', function (): void {
 });
 
 /**
- * Permission callback — enforces both capability and per-attachment ownership.
+ * Permission callback — capability + per-attachment ownership.
  *
- * Two-layer check (mirrors WP core's wp/v2/media/<id> authorization model):
- *
- *   1. Generic capability: `upload_files` — confirms the user is allowed to
- *      manage media at all. Works with Application Passwords (Basic Auth)
- *      because WP authenticates the user before permission callbacks run.
- *      Do NOT use is_user_logged_in() here — it returns false for non-cookie
- *      sessions.
- *
- *   2. Per-object meta-cap: `edit_post $id` — confirms the authenticated user
- *      has edit rights on this specific attachment. Prevents a low-privileged
- *      uploader from overwriting an administrator's (or another user's) media.
- *      WP resolves `edit_post` to `edit_others_posts` when the post is owned
- *      by a different user, which Subscribers/Contributors do not have.
- *
- * @param \WP_REST_Request $request The incoming REST request (WP passes this automatically).
- * @return bool|\WP_Error
+ *   1. `upload_files` — may manage media (App-Password compatible; do NOT use
+ *      is_user_logged_in() which is false for non-cookie sessions).
+ *   2. `edit_post $id` — may edit THIS attachment (blocks overwriting others' media).
  */
 function check_permission(\WP_REST_Request $request): bool|\WP_Error
 {
-    // Layer 1 — generic media capability.
     if (! current_user_can('upload_files')) {
-        return new \WP_Error(
-            'rest_forbidden',
-            'You do not have permission to replace media files.',
-            ['status' => 403]
-        );
+        return new \WP_Error('rest_forbidden', 'You do not have permission to replace media files.', ['status' => 403]);
     }
 
-    // Layer 2 — per-attachment ownership / edit rights.
-    // absint() matches the sanitize_callback registered on the 'id' arg.
     $id = absint($request->get_param('id'));
     if ($id > 0 && ! current_user_can('edit_post', $id)) {
-        return new \WP_Error(
-            'rest_forbidden',
-            'You do not have permission to edit this attachment.',
-            ['status' => 403]
-        );
+        return new \WP_Error('rest_forbidden', 'You do not have permission to edit this attachment.', ['status' => 403]);
     }
 
     return true;
@@ -85,218 +61,275 @@ function check_permission(\WP_REST_Request $request): bool|\WP_Error
 /**
  * Route handler — replaces the file binary for attachment $id in place.
  *
- * Accepts either:
- *   (a) multipart form upload: file in $_FILES['file']
- *   (b) raw binary body with:
- *       Content-Type: <mime-type>
- *       Content-Disposition: attachment; filename="<name>"
- *
- * The original filename and attachment path are preserved so that all
- * existing URLs and theme references keyed to the attachment ID keep
- * working without any database or template changes.
- *
- * @param \WP_REST_Request $request
- * @return \WP_REST_Response|\WP_Error
+ * Scope: images and PDFs only (the types this endpoint can content-validate, which
+ * also covers the logo/badge/brochure-swap use case). The replacement must be the
+ * SAME detected type as the original; the filename/path/URL are preserved.
  */
 function handle_replace(\WP_REST_Request $request): \WP_REST_Response|\WP_Error
 {
     $id = (int) $request->get_param('id');
 
-    // --- 1. Validate the attachment ID ------------------------------------------
-
+    // --- 1. Validate the attachment -------------------------------------------
     $post = get_post($id);
     if (! $post || $post->post_type !== 'attachment') {
-        return new \WP_Error(
-            'rest_not_found',
-            sprintf('No attachment found with ID %d.', $id),
-            ['status' => 404]
-        );
+        return new \WP_Error('rest_not_found', sprintf('No attachment found with ID %d.', $id), ['status' => 404]);
     }
-
-    // --- 2. Retrieve the existing file path ------------------------------------
 
     $existing_path = get_attached_file($id);
     if (! $existing_path) {
-        return new \WP_Error(
-            'rest_server_error',
-            'Could not retrieve the existing file path for this attachment.',
-            ['status' => 500]
-        );
+        return new \WP_Error('rest_server_error', 'Could not retrieve the existing file path for this attachment.', ['status' => 500]);
     }
 
-    // --- 3. Receive incoming file bytes ----------------------------------------
+    // fileinfo is required: without it, content-based type detection is impossible
+    // and wp_check_filetype_and_ext() degrades to (spoofable) extension-only checks.
+    if (! extension_loaded('fileinfo')) {
+        return new \WP_Error('rest_server_error', 'The PHP fileinfo extension is required for secure media replacement.', ['status' => 500]);
+    }
 
-    $tmp_path    = null;
-    $new_mime    = null;
-    $new_name    = null;
+    // --- 2. SECURITY: confine all filesystem ops to the uploads directory ------
+    // Resolve real paths, require the attachment's directory under the uploads
+    // basedir, and refuse symlinks. Defends against a poisoned _wp_attached_file.
+    $upload_dir = wp_upload_dir();
+    if (! empty($upload_dir['error'])) {
+        return new \WP_Error('rest_server_error', 'The uploads directory is not available.', ['status' => 500]);
+    }
+    $base_real   = realpath($upload_dir['basedir']);
+    $target_dir  = dirname($existing_path);
+    $target_real = realpath($target_dir);
+    if (
+        $base_real === false || $target_real === false
+        || ($target_real !== $base_real && ! str_starts_with($target_real, $base_real . DIRECTORY_SEPARATOR))
+    ) {
+        return new \WP_Error('rest_forbidden', 'Attachment path is outside the uploads directory.', ['status' => 403]);
+    }
+    if (is_link($existing_path)) {
+        return new \WP_Error('rest_forbidden', 'Refusing to replace a symlinked attachment.', ['status' => 403]);
+    }
+
+    $final_path = $existing_path;
+    $max_size   = wp_max_upload_size();
+
+    // --- 3. Receive incoming file bytes (size-capped) --------------------------
+    $tmp_path = null;
+    $new_name = null;
 
     if (! empty($_FILES['file']['tmp_name'])) {
-        // (a) Multipart upload via $_FILES
+        // (a) Multipart upload via $_FILES.
         $upload_file = $_FILES['file'];
 
-        if ($upload_file['error'] !== UPLOAD_ERR_OK) {
-            return new \WP_Error(
-                'rest_upload_error',
-                sprintf('PHP file upload error code: %d.', $upload_file['error']),
-                ['status' => 400]
-            );
+        if ((int) $upload_file['error'] !== UPLOAD_ERR_OK) {
+            return new \WP_Error('rest_upload_error', sprintf('PHP file upload error code: %d.', (int) $upload_file['error']), ['status' => 400]);
+        }
+        if (! is_uploaded_file($upload_file['tmp_name'])) {
+            return new \WP_Error('rest_bad_request', 'Invalid file upload (not a POST upload).', ['status' => 400]);
+        }
+        if ((int) ($upload_file['size'] ?? 0) > $max_size) {
+            return new \WP_Error('rest_request_entity_too_large', 'Upload exceeds the maximum allowed size.', ['status' => 413]);
         }
 
-        $tmp_path = sanitize_text_field($upload_file['tmp_name']);
-        $new_mime = sanitize_mime_type($upload_file['type']);
-        $new_name = sanitize_file_name($upload_file['name']);
+        $tmp_path = $upload_file['tmp_name'];
+        $new_name = sanitize_file_name((string) $upload_file['name']);
     } else {
-        // (b) Raw binary body
-        $raw = file_get_contents('php://input');
-
-        if ($raw === false || strlen($raw) === 0) {
-            return new \WP_Error(
-                'rest_bad_request',
-                'No file data received. Send a multipart upload or a raw binary body.',
-                ['status' => 400]
-            );
-        }
-
-        // Parse filename from Content-Disposition: attachment; filename="foo.png"
+        // (b) Raw binary body — streamed to disk with a hard byte cap.
         $disposition = $request->get_header('Content-Disposition');
         if ($disposition && preg_match('/filename=["\']?([^"\';\s]+)["\']?/i', $disposition, $m)) {
             $new_name = sanitize_file_name(trim($m[1]));
         }
 
-        // Parse MIME from Content-Type (strip parameters, e.g. "; boundary=…")
-        $content_type = $request->get_header('Content-Type');
-        if ($content_type) {
-            $new_mime = sanitize_mime_type(strtolower(explode(';', $content_type)[0]));
+        $in = fopen('php://input', 'rb');
+        if ($in === false) {
+            return new \WP_Error('rest_bad_request', 'Could not read the request body.', ['status' => 400]);
         }
-
-        // Write to a WordPress-managed temp file
         $tmp_path = wp_tempnam($new_name ?? 'bud-replace');
         if ($tmp_path === false) {
-            return new \WP_Error(
-                'rest_server_error',
-                'Could not create a temporary file.',
-                ['status' => 500]
-            );
+            fclose($in);
+            return new \WP_Error('rest_server_error', 'Could not create a temporary file.', ['status' => 500]);
+        }
+        $out = fopen($tmp_path, 'wb');
+        if ($out === false) {
+            fclose($in);
+            @unlink($tmp_path);
+            return new \WP_Error('rest_server_error', 'Could not open the temporary file for writing.', ['status' => 500]);
         }
 
-        // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_file_put_contents
-        if (file_put_contents($tmp_path, $raw) === false) {
+        $written = 0;
+        while (! feof($in)) {
+            $chunk = fread($in, 1048576); // 1 MiB
+            if ($chunk === false) {
+                break;
+            }
+            $written += strlen($chunk);
+            if ($written > $max_size) {
+                fclose($in);
+                fclose($out);
+                @unlink($tmp_path);
+                return new \WP_Error('rest_request_entity_too_large', 'Upload exceeds the maximum allowed size.', ['status' => 413]);
+            }
+            if ($chunk !== '' && fwrite($out, $chunk) === false) {
+                fclose($in);
+                fclose($out);
+                @unlink($tmp_path);
+                return new \WP_Error('rest_server_error', 'Could not write incoming bytes to the temporary file.', ['status' => 500]);
+            }
+        }
+        fclose($in);
+        fclose($out);
+
+        if ($written === 0) {
             @unlink($tmp_path);
-            return new \WP_Error(
-                'rest_server_error',
-                'Could not write incoming bytes to the temporary file.',
-                ['status' => 500]
-            );
+            return new \WP_Error('rest_bad_request', 'No file data received. Send a multipart upload or a raw binary body.', ['status' => 400]);
         }
     }
 
-    // --- 4. Security: strict MIME validation (allowlist + magic bytes) ---------
+    // --- 4. SECURITY: detect the ACTUAL type from the bytes (never trust the
+    //         client-declared MIME) and require it to equal the original. The
+    //         filename/extension/URL are preserved, so only a same-type swap is
+    //         valid (a logo/badge/brochure replacement is always same-type).
+    $orig_mime = sanitize_mime_type(strtolower((string) get_post_mime_type($id)));
 
-    $mime_check = validate_file_type($tmp_path, $new_name ?? basename($existing_path), $new_mime);
+    $finfo       = finfo_open(FILEINFO_MIME_TYPE);
+    $actual_mime = $finfo ? finfo_file($finfo, $tmp_path) : false;
+    if ($finfo) {
+        finfo_close($finfo);
+    }
+    if (! is_string($actual_mime) || $actual_mime === '') {
+        @unlink($tmp_path);
+        return new \WP_Error('rest_forbidden', 'Could not determine the type of the uploaded file.', ['status' => 415]);
+    }
+    $actual_mime = sanitize_mime_type(strtolower($actual_mime));
+    // Normalise a couple of common libmagic aliases.
+    $aliases     = ['image/x-png' => 'image/png', 'application/x-pdf' => 'application/pdf'];
+    $actual_mime = $aliases[$actual_mime] ?? $actual_mime;
+
+    if ($orig_mime === '' || $actual_mime !== $orig_mime) {
+        @unlink($tmp_path);
+        return new \WP_Error(
+            'rest_forbidden',
+            sprintf('The replacement file type "%s" must match the original attachment type "%s".', esc_html($actual_mime), esc_html($orig_mime ?: '(unknown)')),
+            ['status' => 415]
+        );
+    }
+
+    // --- 5. Strict allowlist + magic-byte validation against the FINAL filename ---
+    // Pass the detected (not declared) MIME.
+    $mime_check = validate_file_type($tmp_path, basename($final_path), $actual_mime);
     if (is_wp_error($mime_check)) {
         @unlink($tmp_path);
         return $mime_check;
     }
 
-    // --- 5. Determine final path — preserve original filename ------------------
-    //
-    // Default: keep the original filename and path so URLs do not change.
-    // If the caller supplied a different name and the upload dir is writable,
-    // we could rename — but the primary use-case (badge/logo swap) always
-    // keeps the original name, so we default to that.
-
-    $final_path = $existing_path;
-    $upload_dir = wp_upload_dir();
-
-    if ($upload_dir['error']) {
-        @unlink($tmp_path);
-        return new \WP_Error('rest_server_error', $upload_dir['error'], ['status' => 500]);
+    // --- 6. Capture existing metadata. Old artifacts are cleaned up only AFTER a
+    //         successful replace (step 8), so a failed replace leaves the original
+    //         intact. ------------------------------------------------------------
+    if (! function_exists('wp_delete_file_from_directory')) {
+        require_once ABSPATH . 'wp-admin/includes/file.php';
     }
-
-    // Ensure the target directory exists (it should, but be defensive).
-    $target_dir = dirname($final_path);
-    if (! is_dir($target_dir)) {
-        wp_mkdir_p($target_dir);
-    }
-
-    // --- 6. Overwrite the existing file ----------------------------------------
-
-    // Delete old image size derivatives before overwriting so stale
-    // thumbnails are cleaned up.
     $old_meta = wp_get_attachment_metadata($id);
-    if (is_array($old_meta) && ! empty($old_meta['sizes'])) {
-        foreach ($old_meta['sizes'] as $size_data) {
-            $size_file = path_join($target_dir, $size_data['file']);
-            if (file_exists($size_file)) {
-                @unlink($size_file);
+
+    // --- 7. Replace atomically -------------------------------------------------
+    // Stage the bytes INSIDE the validated target directory, then do an atomic
+    // same-directory rename. We never copy() onto $final_path: copy() follows a
+    // destination symlink, whereas rename() replaces the directory entry itself.
+    // Staging in $target_real also avoids a cross-device rename (EXDEV) at the
+    // final step.
+    $stage_path = wp_tempnam(basename($final_path), $target_real);
+    if ($stage_path === false) {
+        @unlink($tmp_path);
+        return new \WP_Error('rest_server_error', 'Could not create a staging file.', ['status' => 500]);
+    }
+    // Move the validated bytes into the staging file. A cross-device temp dir is
+    // handled by copy()+unlink — but only onto the staging file we just created
+    // (a fresh, non-symlink path we control), never onto $final_path.
+    if (! @rename($tmp_path, $stage_path)) {
+        if (! @copy($tmp_path, $stage_path)) {
+            @unlink($tmp_path);
+            @unlink($stage_path);
+            return new \WP_Error('rest_server_error', 'Could not stage the replacement file.', ['status' => 500]);
+        }
+        @unlink($tmp_path);
+    }
+
+    // TOCTOU guard: re-verify the destination immediately before the swap.
+    if (realpath(dirname($final_path)) !== $target_real || is_link($final_path)) {
+        @unlink($stage_path);
+        return new \WP_Error('rest_conflict', 'The destination changed during the replace operation.', ['status' => 409]);
+    }
+
+    // Atomic same-directory rename (replaces a symlink entry rather than following it).
+    if (! @rename($stage_path, $final_path)) {
+        @unlink($stage_path);
+        return new \WP_Error('rest_server_error', 'Could not overwrite the existing file. Check filesystem permissions.', ['status' => 500]);
+    }
+
+    // wp_tempnam() creates 0600 files; restore web-readable perms on the final file.
+    @chmod($final_path, defined('FS_CHMOD_FILE') ? FS_CHMOD_FILE : 0644);
+
+    // --- 8. Clean up ALL stale artifacts, then regenerate metadata -------------
+    // Delete the previous size derivatives AND the full-size `original_image`
+    // (for -scaled uploads), legacy `thumb`, and edit-backup files — so replacing
+    // (e.g. redacting) an image does not leave an old copy publicly reachable.
+    // Everything is confined to $target_real and never touches the file just written.
+    $final_real = realpath($final_path) ?: $final_path;
+    $delete_rel = static function ($rel) use ($target_real, $final_real): void {
+        if (! is_string($rel) || $rel === '') {
+            return;
+        }
+        $candidate = path_join($target_real, $rel);
+        if ((realpath($candidate) ?: $candidate) === $final_real) {
+            return; // never delete the canonical file just written
+        }
+        wp_delete_file_from_directory($candidate, $target_real);
+    };
+    if (is_array($old_meta)) {
+        if (! empty($old_meta['sizes']) && is_array($old_meta['sizes'])) {
+            foreach ($old_meta['sizes'] as $size_data) {
+                if (! empty($size_data['file'])) {
+                    $delete_rel($size_data['file']);
+                }
             }
         }
-    }
-
-    // phpcs:ignore WordPress.WP.AlternativeFunctions.rename_rename
-    if (! rename($tmp_path, $final_path)) {
-        // rename may fail across filesystem boundaries; fall back to copy+delete.
-        // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_copy
-        if (! copy($tmp_path, $final_path)) {
-            @unlink($tmp_path);
-            return new \WP_Error(
-                'rest_server_error',
-                sprintf(
-                    'Could not overwrite the existing file at %s. Check filesystem permissions.',
-                    esc_html($final_path)
-                ),
-                ['status' => 500]
-            );
+        if (! empty($old_meta['original_image'])) {
+            $delete_rel($old_meta['original_image']);
         }
-        @unlink($tmp_path);
+        if (! empty($old_meta['thumb'])) {
+            $delete_rel($old_meta['thumb']);
+        }
+    }
+    $backup_sizes = get_post_meta($id, '_wp_attachment_backup_sizes', true);
+    if (is_array($backup_sizes)) {
+        foreach ($backup_sizes as $backup) {
+            if (! empty($backup['file'])) {
+                $delete_rel($backup['file']);
+            }
+        }
+        delete_post_meta($id, '_wp_attachment_backup_sizes');
     }
 
-    // --- 7. Update attachment metadata in the database -------------------------
-
-    // Update the file path record (may be unchanged, but keeps DB consistent).
     update_attached_file($id, $final_path);
 
-    // If MIME type has changed, update the attachment post's mime_type.
-    $resolved_mime = $new_mime ?: get_post_mime_type($id);
-    if ($resolved_mime && $resolved_mime !== get_post_mime_type($id)) {
-        wp_update_post([
-            'ID'             => $id,
-            'post_mime_type' => sanitize_mime_type($resolved_mime),
-        ]);
-    }
-
-    // Regenerate image metadata (sizes, dimensions, etc.).
-    // These includes are needed outside of wp-admin context.
     require_once ABSPATH . 'wp-admin/includes/image.php';
     require_once ABSPATH . 'wp-admin/includes/file.php';
     require_once ABSPATH . 'wp-admin/includes/media.php';
 
+    // Fresh metadata; on failure store minimal state rather than stale references.
     $new_meta = wp_generate_attachment_metadata($id, $final_path);
-    if (is_wp_error($new_meta)) {
-        // Non-fatal: metadata may not regenerate for non-image types.
-        $new_meta = $old_meta ?: [];
+    if (is_wp_error($new_meta) || ! is_array($new_meta)) {
+        $new_meta = [];
     }
     wp_update_attachment_metadata($id, $new_meta);
 
-    // --- 8. Build and return the updated attachment representation -------------
-
-    // Fetch the fully updated attachment through the REST controller so the
-    // response matches the standard WP media REST schema.
+    // --- 9. Return the updated attachment representation ------------------------
     $controller = new \WP_REST_Attachments_Controller('attachment');
-    $attachment  = get_post($id);
-
+    $attachment = get_post($id);
     if (! $attachment) {
         return new \WP_Error('rest_server_error', 'Attachment not found after replace.', ['status' => 500]);
     }
-
     $rest_request = new \WP_REST_Request('GET', '/wp/v2/media/' . $id);
     $rest_request->set_param('context', 'view');
     $item = $controller->prepare_item_for_response($attachment, $rest_request);
-
     if (is_wp_error($item)) {
         return $item;
     }
-
     $data = $controller->prepare_response_for_collection($item);
 
     return new \WP_REST_Response(
@@ -311,47 +344,35 @@ function handle_replace(\WP_REST_Request $request): \WP_REST_Response|\WP_Error
 }
 
 /**
- * Validates a file's type through three independent layers.
+ * Validates a file's type. Images and PDFs only — the types this endpoint can
+ * content-validate end to end.
  *
- * Layer 1 — Explicit allowlist: rejects any MIME type not in the approved set.
- *   SVG is intentionally excluded: it can carry embedded JS/XSS and requires
- *   a dedicated sanitizer (e.g. enshrined/svg-sanitize) that is not bundled
- *   here. Add it back only if you bundle a sanitizer and run it before writing.
+ * Layer 0 — fileinfo required (checked by the caller too).
+ * Layer 1 — strict allowlist (image/* + PDF; every entry has a magic-byte signature).
+ * Layer 2 — WordPress-native detection via wp_check_filetype_and_ext() (filename + contents).
+ * Layer 3 — magic-byte signature check.
  *
- * Layer 2 — WordPress-native detection: wp_check_filetype_and_ext() uses the
- *   filename extension AND (where finfo/getimagesize is available) the actual
- *   file contents to independently determine the real MIME type. If WP detects
- *   a mismatch or rejects the type, the upload is refused.
- *
- * Layer 3 — Magic-byte check: reads the first N bytes and compares against
- *   known binary signatures for image and PDF types. Catches renamed executables
- *   that slipped past the previous layers (e.g. `evil.php` → `image.jpg`).
- *
- * @param string      $file_path  Absolute path to the temp file.
- * @param string      $filename   Original filename (used by wp_check_filetype_and_ext).
- * @param string|null $declared   Caller-declared MIME type (from Content-Type header or $_FILES).
+ * @param string      $file_path Absolute path to the temp file.
+ * @param string      $filename  FINAL destination filename (extension checked matches
+ *                               the file that will actually exist on disk).
+ * @param string|null $declared  DETECTED MIME (from finfo), passed by the caller.
  * @return true|\WP_Error
  */
 function validate_file_type(string $file_path, string $filename, ?string $declared): true|\WP_Error
 {
-    // ------------------------------------------------------------------
-    // Layer 1: Strict explicit allowlist.
-    // Only MIME types listed here can be replaced via this endpoint.
-    // Anything else — including SVG, text/html, application/x-php — is
-    // immediately rejected before any bytes reach the filesystem.
-    // ------------------------------------------------------------------
+    if (! extension_loaded('fileinfo')) {
+        return new \WP_Error('rest_server_error', 'The PHP fileinfo extension is required for secure media replacement.', ['status' => 500]);
+    }
+
+    // Layer 1 — strict allowlist. Only content-validatable types are permitted.
+    // (SVG excluded — needs a sanitizer; office/audio/video excluded — cannot be
+    // reliably content-validated here.)
     $allowed_mimes = [
-        'image/jpeg'        => true,
-        'image/png'         => true,
-        'image/gif'         => true,
-        'image/webp'        => true,
-        'application/pdf'   => true,
-        'audio/mpeg'        => true,   // .mp3
-        'audio/wav'         => true,
-        'video/mp4'         => true,
-        'application/msword' => true,  // .doc
-        'application/vnd.openxmlformats-officedocument.wordprocessingml.document' => true, // .docx
-        'text/plain'        => true,
+        'image/jpeg'      => true,
+        'image/png'       => true,
+        'image/gif'       => true,
+        'image/webp'      => true,
+        'application/pdf' => true,
     ];
 
     $declared_clean = $declared ? sanitize_mime_type(strtolower(trim($declared))) : '';
@@ -359,104 +380,68 @@ function validate_file_type(string $file_path, string $filename, ?string $declar
     if (! isset($allowed_mimes[$declared_clean])) {
         return new \WP_Error(
             'rest_forbidden',
-            sprintf(
-                'MIME type "%s" is not permitted by this endpoint. Allowed types: %s.',
-                esc_html($declared_clean ?: '(none)'),
-                implode(', ', array_keys($allowed_mimes))
-            ),
+            sprintf('File type "%s" is not permitted by this endpoint. Allowed types: %s.', esc_html($declared_clean ?: '(none)'), implode(', ', array_keys($allowed_mimes))),
             ['status' => 415]
         );
     }
 
-    // Also verify the declared MIME is in WordPress's per-user allowed set.
-    // Administrators have a broader list; Editors may have fewer types enabled.
+    // Honour the per-user allowed set (roles may restrict types further).
     $wp_allowed = get_allowed_mime_types();
     if (! in_array($declared_clean, $wp_allowed, true)) {
         return new \WP_Error(
             'rest_forbidden',
-            sprintf('MIME type "%s" is not permitted for your user role.', esc_html($declared_clean)),
+            sprintf('File type "%s" is not permitted for your user role.', esc_html($declared_clean)),
             ['status' => 415]
         );
     }
 
-    // ------------------------------------------------------------------
-    // Layer 2: WordPress-native filetype detection.
-    // wp_check_filetype_and_ext() independently determines the real type
-    // from the filename extension and (on capable hosts) file contents.
-    // A return value of `type === false` means WP rejects the file.
-    // ------------------------------------------------------------------
-
-    // Include the function if not yet loaded (outside wp-admin context).
+    // Layer 2 — WordPress-native detection (filename + contents).
     if (! function_exists('wp_check_filetype_and_ext')) {
         require_once ABSPATH . 'wp-admin/includes/file.php';
     }
-
     $wp_check = wp_check_filetype_and_ext($file_path, $filename, $wp_allowed);
-
     if (false === $wp_check['type']) {
-        return new \WP_Error(
-            'rest_forbidden',
-            sprintf('WordPress rejected the file type for "%s". Upload refused.', esc_html($filename)),
-            ['status' => 415]
-        );
+        return new \WP_Error('rest_forbidden', sprintf('WordPress rejected the file type for "%s". Upload refused.', esc_html($filename)), ['status' => 415]);
     }
-
-    // If WP could detect a real MIME, verify it matches what was declared.
     if (! empty($wp_check['type']) && $wp_check['type'] !== $declared_clean) {
         return new \WP_Error(
             'rest_forbidden',
-            sprintf(
-                'Declared MIME type "%s" does not match detected type "%s". Upload refused.',
-                esc_html($declared_clean),
-                esc_html($wp_check['type'])
-            ),
+            sprintf('Detected type "%s" does not match the destination extension for "%s". Upload refused.', esc_html($declared_clean), esc_html($filename)),
             ['status' => 415]
         );
     }
 
-    // ------------------------------------------------------------------
-    // Layer 3: Magic-byte validation for binary types.
-    // Even after the above checks, confirm the file's leading bytes match
-    // the expected signature. This catches edge cases where finfo is not
-    // available and WP had to rely solely on the extension.
-    // ------------------------------------------------------------------
+    // Layer 3 — magic-byte validation (covers every allowed type).
     $signatures = [
         'image/jpeg'      => [0xFF, 0xD8, 0xFF],
         'image/png'       => [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A],
-        'image/gif'       => [0x47, 0x49, 0x46, 0x38],   // GIF8
-        'image/webp'      => [0x52, 0x49, 0x46, 0x46],   // RIFF header
-        'application/pdf' => [0x25, 0x50, 0x44, 0x46],   // %PDF
+        'image/gif'       => [0x47, 0x49, 0x46, 0x38],
+        'image/webp'      => [0x52, 0x49, 0x46, 0x46],
+        'application/pdf' => [0x25, 0x50, 0x44, 0x46],
     ];
 
-    if (isset($signatures[$declared_clean])) {
-        $expected = $signatures[$declared_clean];
-        $needed   = count($expected);
+    $expected = $signatures[$declared_clean];
+    $needed   = count($expected);
 
-        // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_fopen
-        $fh = fopen($file_path, 'rb');
-        if (! $fh) {
-            return new \WP_Error('rest_server_error', 'Could not open uploaded file for validation.', ['status' => 500]);
-        }
+    $fh = fopen($file_path, 'rb');
+    if (! $fh) {
+        return new \WP_Error('rest_server_error', 'Could not open the uploaded file for validation.', ['status' => 500]);
+    }
+    $header = fread($fh, $needed);
+    fclose($fh);
 
-        $header = fread($fh, $needed);
-        fclose($fh);
+    if (strlen($header) < $needed) {
+        return new \WP_Error('rest_bad_request', 'Uploaded file is too small to validate.', ['status' => 400]);
+    }
 
-        if (strlen($header) < $needed) {
-            return new \WP_Error('rest_bad_request', 'Uploaded file is too small to validate.', ['status' => 400]);
-        }
-
-        $actual = array_values(unpack('C*', $header));
-        foreach ($expected as $i => $byte) {
-            if ($actual[$i] !== $byte) {
-                return new \WP_Error(
-                    'rest_forbidden',
-                    sprintf(
-                        'File content does not match declared MIME type "%s". Upload rejected.',
-                        esc_html($declared_clean)
-                    ),
-                    ['status' => 415]
-                );
-            }
+    $actual = array_values(unpack('C*', $header));
+    foreach ($expected as $i => $byte) {
+        if ($actual[$i] !== $byte) {
+            return new \WP_Error(
+                'rest_forbidden',
+                sprintf('File content does not match type "%s". Upload rejected.', esc_html($declared_clean)),
+                ['status' => 415]
+            );
         }
     }
 
