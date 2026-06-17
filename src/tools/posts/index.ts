@@ -157,12 +157,14 @@ export class PostTools {
    */
   public async handleGetPost(
     client: WordPressClient,
-    params: { id: number } | Record<string, unknown>,
+    params: { id: number; include_content?: boolean; raw?: boolean } | Record<string, unknown>,
   ): Promise<WordPressPost | string> {
     // Extract only the relevant parameters
-    const postParams = {
+    const postParams: { id: number; include_content?: boolean; raw?: boolean } = {
       id: params.id as number,
     };
+    if (params.include_content !== undefined) postParams.include_content = params.include_content as boolean;
+    if (params.raw !== undefined) postParams.raw = params.raw as boolean;
 
     return handleGetPost(client, postParams);
   }

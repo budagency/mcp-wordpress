@@ -21,6 +21,8 @@ export type WordPressMeta = Record<string, unknown> | unknown[];
 // Common WordPress API response patterns
 export interface WordPressRendered {
   rendered: string;
+  /** Raw (unprocessed) content — only present when fetched with context=edit */
+  raw?: string;
   protected?: boolean;
 }
 

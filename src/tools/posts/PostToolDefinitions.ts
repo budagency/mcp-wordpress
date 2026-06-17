@@ -61,7 +61,8 @@ export const getPostTool: MCPTool = {
     "Retrieves detailed information about a single post including metadata, content statistics, and management links. Optionally includes full HTML content for editing.\n\n" +
     "**Usage Examples:**\n" +
     "• Basic metadata: `wp_get_post --id=123`\n" +
-    "• With full content: `wp_get_post --id=123 --include_content=true`",
+    "• With full content: `wp_get_post --id=123 --include_content=true`\n" +
+    "• Raw content for editing: `wp_get_post --id=123 --raw=true` (returns content.raw + content.rendered + title.raw)",
   inputSchema: {
     type: "object",
     properties: {
@@ -72,6 +73,13 @@ export const getPostTool: MCPTool = {
       include_content: {
         type: "boolean",
         description: "If true, includes the full HTML content of the post for editing. Default: false",
+      },
+      raw: {
+        type: "boolean",
+        description:
+          "If true, fetches the post with context=edit and returns BOTH content.raw (unprocessed Gutenberg/shortcode source) " +
+          "and content.rendered (expanded HTML), plus title.raw. Use this when you need to edit the raw content rather than " +
+          "the rendered HTML. Requires authentication as an editor or administrator. Default: false",
       },
     },
     required: ["id"],

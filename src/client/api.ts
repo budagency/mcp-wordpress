@@ -64,6 +64,18 @@ import { UsersOperations } from "./operations/users.js";
 import { CommentsOperations } from "./operations/comments.js";
 import { TaxonomiesOperations } from "./operations/taxonomies.js";
 import { SiteOperations } from "./operations/site.js";
+import {
+  MenusOperations,
+  type WordPressMenu,
+  type WordPressMenuItem,
+  type WordPressWidget,
+  type WordPressSidebar,
+  type CreateMenuRequest,
+  type UpdateMenuRequest,
+  type CreateMenuItemRequest,
+  type UpdateMenuItemRequest,
+  type MenuItemQueryParams,
+} from "./operations/menus.js";
 
 /**
  * WordPress REST API Client
@@ -134,6 +146,7 @@ export class WordPressClient implements IWordPressClient {
   private readonly commentsOps: CommentsOperations;
   private readonly taxonomiesOps: TaxonomiesOperations;
   private readonly siteOps: SiteOperations;
+  private readonly menusOps: MenusOperations;
 
   /**
    * Creates a new WordPress API client instance.
@@ -217,6 +230,7 @@ export class WordPressClient implements IWordPressClient {
     this.commentsOps = new CommentsOperations(this);
     this.taxonomiesOps = new TaxonomiesOperations(this);
     this.siteOps = new SiteOperations(this);
+    this.menusOps = new MenusOperations(this);
   }
 
   get config(): WordPressClientConfig {
@@ -908,6 +922,14 @@ export class WordPressClient implements IWordPressClient {
     return this.postsOps.getPostRevisions(id);
   }
 
+  async getPostRevision(parentId: number, revisionId: number): Promise<WordPressPost> {
+    return this.postsOps.getPostRevision(parentId, revisionId);
+  }
+
+  async restorePostRevision(parentId: number, revisionId: number): Promise<WordPressPost> {
+    return this.postsOps.restorePostRevision(parentId, revisionId);
+  }
+
   // ============================================================================
   // Pages Operations (delegated to PagesOperations)
   // ============================================================================
@@ -934,6 +956,14 @@ export class WordPressClient implements IWordPressClient {
 
   async getPageRevisions(id: number): Promise<WordPressPage[]> {
     return this.pagesOps.getPageRevisions(id);
+  }
+
+  async getPageRevision(parentId: number, revisionId: number): Promise<WordPressPage> {
+    return this.pagesOps.getPageRevision(parentId, revisionId);
+  }
+
+  async restorePageRevision(parentId: number, revisionId: number): Promise<WordPressPage> {
+    return this.pagesOps.restorePageRevision(parentId, revisionId);
   }
 
   // ============================================================================
@@ -968,6 +998,10 @@ export class WordPressClient implements IWordPressClient {
 
   async deleteMedia(id: number, force = false): Promise<{ deleted: boolean; previous?: WordPressMedia }> {
     return this.mediaOps.deleteMedia(id, force);
+  }
+
+  async replaceMedia(id: number, fileData: Buffer, filename: string, mimeType: string): Promise<WordPressMedia> {
+    return this.mediaOps.replaceMedia(id, fileData, filename, mimeType);
   }
 
   // ============================================================================
@@ -1120,6 +1154,66 @@ export class WordPressClient implements IWordPressClient {
 
   async getServerInfo(): Promise<Record<string, unknown>> {
     return this.siteOps.getServerInfo();
+  }
+
+  // ============================================================================
+  // Menus, Menu Items, Widgets & Sidebars (WP 5.9+, edit_theme_options)
+  // ============================================================================
+
+  async listMenus(): Promise<WordPressMenu[]> {
+    return this.menusOps.listMenus();
+  }
+
+  async getMenu(id: number): Promise<WordPressMenu> {
+    return this.menusOps.getMenu(id);
+  }
+
+  async createMenu(data: CreateMenuRequest): Promise<WordPressMenu> {
+    return this.menusOps.createMenu(data);
+  }
+
+  async updateMenu(id: number, data: UpdateMenuRequest): Promise<WordPressMenu> {
+    return this.menusOps.updateMenu(id, data);
+  }
+
+  async deleteMenu(id: number, force = true): Promise<{ deleted: boolean; previous?: WordPressMenu }> {
+    return this.menusOps.deleteMenu(id, force);
+  }
+
+  async listMenuItems(params?: MenuItemQueryParams): Promise<WordPressMenuItem[]> {
+    return this.menusOps.listMenuItems(params);
+  }
+
+  async createMenuItem(data: CreateMenuItemRequest): Promise<WordPressMenuItem> {
+    return this.menusOps.createMenuItem(data);
+  }
+
+  async updateMenuItem(id: number, data: UpdateMenuItemRequest): Promise<WordPressMenuItem> {
+    return this.menusOps.updateMenuItem(id, data);
+  }
+
+  async deleteMenuItem(id: number, force = true): Promise<{ deleted: boolean; previous?: WordPressMenuItem }> {
+    return this.menusOps.deleteMenuItem(id, force);
+  }
+
+  async listWidgets(sidebar?: string): Promise<WordPressWidget[]> {
+    return this.menusOps.listWidgets(sidebar);
+  }
+
+  async getWidget(id: string): Promise<WordPressWidget> {
+    return this.menusOps.getWidget(id);
+  }
+
+  async updateWidget(id: string, data: Partial<WordPressWidget>): Promise<WordPressWidget> {
+    return this.menusOps.updateWidget(id, data);
+  }
+
+  async listSidebars(): Promise<WordPressSidebar[]> {
+    return this.menusOps.listSidebars();
+  }
+
+  async getSidebar(id: string): Promise<WordPressSidebar> {
+    return this.menusOps.getSidebar(id);
   }
 
   // ============================================================================

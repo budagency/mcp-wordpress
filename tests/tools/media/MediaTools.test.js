@@ -64,13 +64,14 @@ describe("MediaTools", () => {
     it("should return all media tool definitions", () => {
       const tools = mediaTools.getTools();
 
-      expect(tools).toHaveLength(5);
+      expect(tools).toHaveLength(6);
       expect(tools.map((t) => t.name)).toEqual([
         "wp_list_media",
         "wp_get_media",
         "wp_upload_media",
         "wp_update_media",
         "wp_delete_media",
+        "wp_replace_media",
       ]);
     });
 

@@ -201,11 +201,12 @@ export async function handleListPosts(
  */
 export async function handleGetPost(
   client: WordPressClient,
-  params: { id: number; include_content?: boolean },
+  params: { id: number; include_content?: boolean; raw?: boolean },
 ): Promise<WordPressPost | string> {
   try {
     const postId = validateId(params.id, "post ID");
-    const post = await client.getPost(postId);
+    const context = params.raw ? "edit" : "view";
+    const post = await client.getPost(postId, context);
 
     // Get additional metadata for comprehensive response
     const [author, categories, tags] = await Promise.all([
@@ -268,10 +269,21 @@ export async function handleGetPost(
       response += `\n## Excerpt\n${excerpt}\n`;
     }
 
-    // Only include full content if explicitly requested (for backward compatibility, default to true)
-    const includeContent = params.include_content !== false;
-    if (content && includeContent) {
-      response += `\n## Content\n${content}\n`;
+    // When raw=true: return both raw (editable source) and rendered (expanded HTML)
+    if (params.raw) {
+      const rawContent = post.content?.raw;
+      const rawTitle = post.title?.raw;
+      if (rawTitle !== undefined) {
+        response += `\n## Title (raw)\n${rawTitle}\n`;
+      }
+      response += `\n## Content (raw — edit this)\n${rawContent ?? "(not available — ensure context=edit is supported)"}\n`;
+      response += `\n## Content (rendered — for reference only)\n${content}\n`;
+    } else {
+      // Only include full content if explicitly requested (for backward compatibility, default to true)
+      const includeContent = params.include_content !== false;
+      if (content && includeContent) {
+        response += `\n## Content\n${content}\n`;
+      }
     }
 
     // Add management links and metadata

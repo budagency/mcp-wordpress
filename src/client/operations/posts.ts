@@ -65,4 +65,29 @@ export class PostsOperations {
   async getPostRevisions(id: number): Promise<WordPressPost[]> {
     return this.client.get<WordPressPost[]>(`posts/${id}/revisions`);
   }
+
+  /**
+   * Get a single revision by ID (context=edit to get raw content)
+   */
+  async getPostRevision(parentId: number, revisionId: number): Promise<WordPressPost> {
+    return this.client.get<WordPressPost>(`posts/${parentId}/revisions/${revisionId}?context=edit`);
+  }
+
+  /**
+   * Restore a post to a previous revision.
+   * Fetches the revision's raw content and PUTs it back to the parent post.
+   * Returns the updated post.
+   */
+  async restorePostRevision(parentId: number, revisionId: number): Promise<WordPressPost> {
+    const revision = await this.getPostRevision(parentId, revisionId);
+    // Prefer raw (unprocessed) content; fall back to rendered if context=edit not supported
+    const payload: Record<string, string> = {
+      title: revision.title?.raw ?? revision.title?.rendered ?? "",
+      content: revision.content?.raw ?? revision.content?.rendered ?? "",
+    };
+    if (revision.excerpt?.raw !== undefined || revision.excerpt?.rendered !== undefined) {
+      payload.excerpt = revision.excerpt?.raw ?? revision.excerpt?.rendered ?? "";
+    }
+    return this.client.put<WordPressPost>(`posts/${parentId}`, payload);
+  }
 }

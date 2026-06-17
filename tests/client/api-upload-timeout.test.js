@@ -96,8 +96,10 @@ describe("WordPress API Client Upload Timeout", () => {
 
   describe("uploadMedia method timeout behavior", () => {
     it("should use default 5-minute timeout", async () => {
-      // Mock upload request
+      // uploadFile POSTs the raw binary, then (because title is set) does a
+      // follow-up PUT /media/<id> with the metadata. Both mocks are required.
       nock(testBaseUrl).post("/wp-json/wp/v2/media").reply(200, { id: 456, title: "media-upload" });
+      nock(testBaseUrl).put("/wp-json/wp/v2/media/456").reply(200, { id: 456, title: "Test Media" });
 
       // Test uploadFile directly instead of uploadMedia to avoid fs mocking issues
       const result = await client.uploadFile(testFile, "test-media.txt", "text/plain", { title: "Test Media" });
@@ -166,12 +168,20 @@ describe("WordPress API Client Upload Timeout", () => {
     });
   });
 
-  describe("FormData handling with timeout", () => {
-    it("should properly handle FormData uploads with timeout", async () => {
+  describe("raw-binary upload with timeout", () => {
+    it("should properly handle raw-binary uploads with timeout", async () => {
+      // uploadFile sends raw binary to POST /media, then (alt_text is set)
+      // follows up with PUT /media/<id> for metadata. Both mocks required.
       nock(testBaseUrl).post("/wp-json/wp/v2/media").reply(200, {
         id: 111,
-        title: "form-data-upload",
+        title: "raw-binary-upload",
         media_type: "image",
+      });
+      nock(testBaseUrl).put("/wp-json/wp/v2/media/111").reply(200, {
+        id: 111,
+        title: "raw-binary-upload",
+        media_type: "image",
+        alt_text: "Test image",
       });
 
       const result = await client.uploadFile(
@@ -208,11 +218,27 @@ describe("WordPress API Client Upload Timeout", () => {
 
   describe("upload permission handling", () => {
     it("should handle network connection errors during upload", async () => {
+      // Media CREATE is non-retryable (retries:1 in uploadFile) to prevent
+      // duplicate attachments. A single interceptor covers the single attempt.
       nock(testBaseUrl).post("/wp-json/wp/v2/media").replyWithError("socket hang up");
 
       await expect(client.uploadFile(testFile, "test.txt", "text/plain", {}, { timeout: 1000 })).rejects.toThrow(
         /Network connection lost during request/,
       );
+    });
+
+    it("should make exactly one POST attempt for media create (non-retryable to prevent duplicate attachments)", async () => {
+      // Regression guard for the duplicate-attachment fix: uploadFile sets retries:1
+      // so a media CREATE makes a single POST even though a Buffer body is otherwise
+      // retryable (api.ts isRetryableBody). Must use a RETRYABLE *network* error to
+      // prove it — an HTTP 5xx is never retried regardless of retries:1, so it would
+      // be a false guard. With the fix the thrown message says "after 1 attempt";
+      // drop retries:1 and the retry would re-POST (no interceptor) → "after 3 attempts".
+      nock(testBaseUrl).post("/wp-json/wp/v2/media").replyWithError("socket hang up");
+
+      await expect(
+        client.uploadFile(testFile, "create-single-attempt.txt", "text/plain", {}, { timeout: 1000 }),
+      ).rejects.toThrow(/after 1 attempt/);
     });
 
     it("should set max listeners to prevent EventEmitter warnings", async () => {

@@ -19,6 +19,8 @@ export interface MediaClientBase {
   post<T>(endpoint: string, data?: unknown, options?: RequestOptions): Promise<T>;
   put<T>(endpoint: string, data?: unknown): Promise<T>;
   delete<T>(endpoint: string): Promise<T>;
+  /** Returns the site base URL (e.g. https://example.com) without trailing slash. */
+  getSiteUrl(): string;
 }
 
 /**
@@ -105,8 +107,12 @@ export class MediaOperations {
     // passed". Send the raw binary with a Content-Disposition header (the WP REST
     // media endpoint accepts this), then apply any metadata via a follow-up update.
     const uploadTimeout = options?.timeout !== undefined ? options.timeout : 600000; // 10 minutes default
+    // Non-idempotent create — single attempt to avoid duplicate attachments on
+    // a post-processing network error (a Buffer body would otherwise be retried;
+    // see api.ts isRetryableBody). retries:1 → configuredRetries=1 → maxAttempts=1.
     const created = await this.client.post<WordPressMedia>("media", fileData, {
       ...options,
+      retries: 1,
       timeout: uploadTimeout,
       headers: {
         ...options?.headers,
@@ -144,6 +150,40 @@ export class MediaOperations {
   }
 
   /**
+   * Replace the binary of an existing attachment in place.
+   *
+   * Sends the file bytes to the Bud Media Replace plugin route
+   * (`POST /wp-json/bud/v1/media/<id>/replace`) using the same raw-binary
+   * transport established in uploadFile. The attachment ID, original filename,
+   * and all existing URLs are preserved — only the bytes on disk change.
+   *
+   * Magic-byte validation is applied before the network call to catch
+   * disguised files early (mirrors uploadMedia behaviour).
+   *
+   * @param id       Attachment ID to replace.
+   * @param fileData Raw file bytes.
+   * @param filename Original or replacement filename (used in Content-Disposition).
+   * @param mimeType MIME type of the new file (used in Content-Type + magic check).
+   */
+  async replaceMedia(id: number, fileData: Buffer, filename: string, mimeType: string): Promise<WordPressMedia> {
+    this.validateMagicBytes(fileData, mimeType, filename);
+
+    const siteUrl = this.client.getSiteUrl();
+    // Build absolute URL — api.ts:request() detects the "http" prefix and uses it
+    // verbatim instead of prepending the default /wp-json/wp/v2 base path.
+    const absoluteUrl = `${siteUrl}/wp-json/bud/v1/media/${id}/replace`;
+
+    log.debug(`Replacing media ${id} at ${absoluteUrl} (${fileData.length} bytes)`);
+
+    return this.client.post<WordPressMedia>(absoluteUrl, fileData, {
+      headers: {
+        "Content-Type": mimeType,
+        "Content-Disposition": `attachment; filename="${filename}"`,
+      },
+    });
+  }
+
+  /**
    * Validates that a file's magic bytes match its declared MIME type.
    * Prevents disguised uploads (e.g. a PHP script renamed to .jpg).
    */
@@ -173,23 +213,34 @@ export class MediaOperations {
    * Get MIME type from file extension
    */
   private getMimeType(filePath: string): string {
-    const ext = path.extname(filePath).toLowerCase();
-    const mimeTypes: Record<string, string> = {
-      ".jpg": "image/jpeg",
-      ".jpeg": "image/jpeg",
-      ".png": "image/png",
-      ".gif": "image/gif",
-      ".webp": "image/webp",
-      ".svg": "image/svg+xml",
-      ".pdf": "application/pdf",
-      ".doc": "application/msword",
-      ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-      ".txt": "text/plain",
-      ".mp4": "video/mp4",
-      ".mp3": "audio/mpeg",
-      ".wav": "audio/wav",
-    };
-
-    return mimeTypes[ext] || "application/octet-stream";
+    return getMimeTypeFromPath(filePath);
   }
+}
+
+/**
+ * Resolves a MIME type from a file extension.
+ *
+ * Exported so that the tool layer (src/tools/media.ts) can derive the MIME
+ * type without duplicating the lookup table. The private `getMimeType` method
+ * on MediaOperations delegates here.
+ */
+export function getMimeTypeFromPath(filePath: string): string {
+  const ext = path.extname(filePath).toLowerCase();
+  const mimeTypes: Record<string, string> = {
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".svg": "image/svg+xml",
+    ".pdf": "application/pdf",
+    ".doc": "application/msword",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".txt": "text/plain",
+    ".mp4": "video/mp4",
+    ".mp3": "audio/mpeg",
+    ".wav": "audio/wav",
+  };
+
+  return mimeTypes[ext] || "application/octet-stream";
 }

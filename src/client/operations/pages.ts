@@ -68,4 +68,28 @@ export class PagesOperations {
   async getPageRevisions(id: number): Promise<WordPressPage[]> {
     return this.client.get<WordPressPage[]>(`pages/${id}/revisions`);
   }
+
+  /**
+   * Get a single page revision by ID (context=edit to get raw content)
+   */
+  async getPageRevision(parentId: number, revisionId: number): Promise<WordPressPage> {
+    return this.client.get<WordPressPage>(`pages/${parentId}/revisions/${revisionId}?context=edit`);
+  }
+
+  /**
+   * Restore a page to a previous revision.
+   * Fetches the revision's raw content and PUTs it back to the parent page.
+   * Returns the updated page.
+   */
+  async restorePageRevision(parentId: number, revisionId: number): Promise<WordPressPage> {
+    const revision = await this.getPageRevision(parentId, revisionId);
+    const payload: Record<string, string> = {
+      title: revision.title?.raw ?? revision.title?.rendered ?? "",
+      content: revision.content?.raw ?? revision.content?.rendered ?? "",
+    };
+    if (revision.excerpt?.raw !== undefined || revision.excerpt?.rendered !== undefined) {
+      payload.excerpt = revision.excerpt?.raw ?? revision.excerpt?.rendered ?? "";
+    }
+    return this.client.put<WordPressPage>(`pages/${parentId}`, payload);
+  }
 }
