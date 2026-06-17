@@ -66,6 +66,16 @@ URL are preserved, so a logo/badge/brochure swap is always same-type).
   entry rather than following it) after a final TOCTOU re-check — `copy()` is
   never used on the destination path.
 
+=== Residual considerations (by design / host-level) ===
+
+- No application-level rate limiting — relies on the host/WAF plus the admin-only
+  capability gate. Errors are opaque; 404-vs-403 attachment-ID enumeration is
+  possible but low-value given the auth requirement.
+- The web server MUST NOT execute PHP in wp-content/uploads/ — an image+PHP
+  polyglot would pass type validation (identical to core WordPress upload risk).
+- PDFs may carry JavaScript / embedded payloads (same as any WordPress PDF upload);
+  a same-type PDF replacement is permitted by design.
+
 === File replacement sequence ===
 
 1. Validate the attachment and require `fileinfo`.
@@ -127,6 +137,14 @@ To ensure the plugin cannot be accidentally deactivated, drop it into:
 Note: mu-plugins cannot be activated/deactivated from the admin UI.
 
 == Changelog ==
+
+= 1.5.0 =
+* Hardening (GLM/z.ai review): guard the cross-device copy() fallback against a
+  swapped staging symlink; re-verify the destination is a regular file within
+  uploads after the final rename (closes a staging-symlink TOCTOU that could turn
+  the attachment URL into an arbitrary-file read); explicit path-containment in the
+  artifact-cleanup closure; WebP magic now also checks the "WEBP" form-type at
+  offset 8 (RIFF alone matches WAV/AVI); handler-level edit_post re-check.
 
 = 1.4.0 =
 * Security/privacy: on replace, also delete the full-size `original_image`,

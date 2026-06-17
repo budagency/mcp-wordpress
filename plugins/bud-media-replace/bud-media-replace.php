@@ -3,7 +3,7 @@
  * Plugin Name: Bud Media Replace
  * Plugin URI:  https://bud.agency
  * Description: Headless REST route to replace a media attachment's binary in place, keeping the same attachment ID, filename, and all existing URLs. Images and PDFs only. Requires PHP 8.0+.
- * Version:     1.4.0
+ * Version:     1.5.0
  * Author:      Bud Agency
  * Author URI:  https://bud.agency
  * License:     GPL-2.0-or-later
@@ -73,6 +73,13 @@ function handle_replace(\WP_REST_Request $request): \WP_REST_Response|\WP_Error
     $post = get_post($id);
     if (! $post || $post->post_type !== 'attachment') {
         return new \WP_Error('rest_not_found', sprintf('No attachment found with ID %d.', $id), ['status' => 404]);
+    }
+
+    // Defence-in-depth: re-assert per-attachment edit rights. The route's
+    // permission_callback already enforces this; re-checking guards against a
+    // future misregistration or the handler being reached via another path.
+    if (! current_user_can('edit_post', $id)) {
+        return new \WP_Error('rest_forbidden', 'You do not have permission to edit this attachment.', ['status' => 403]);
     }
 
     $existing_path = get_attached_file($id);
@@ -241,6 +248,13 @@ function handle_replace(\WP_REST_Request $request): \WP_REST_Response|\WP_Error
     // handled by copy()+unlink — but only onto the staging file we just created
     // (a fresh, non-symlink path we control), never onto $final_path.
     if (! @rename($tmp_path, $stage_path)) {
+        // Cross-device fallback. copy() FOLLOWS a destination symlink, so guard
+        // against $stage_path being swapped between wp_tempnam() and here — it must
+        // still be the regular file wp_tempnam created.
+        if (is_link($stage_path) || ! is_file($stage_path)) {
+            @unlink($tmp_path);
+            return new \WP_Error('rest_conflict', 'Staging file was tampered with.', ['status' => 409]);
+        }
         if (! @copy($tmp_path, $stage_path)) {
             @unlink($tmp_path);
             @unlink($stage_path);
@@ -261,6 +275,19 @@ function handle_replace(\WP_REST_Request $request): \WP_REST_Response|\WP_Error
         return new \WP_Error('rest_server_error', 'Could not overwrite the existing file. Check filesystem permissions.', ['status' => 500]);
     }
 
+    // Post-swap guard: if $stage_path was swapped for a symlink in the race window,
+    // rename() would have moved that symlink into place (rename moves the link
+    // itself). Reject and remove it — unlink() on a symlink removes the link, never
+    // its target — so the attachment URL can't be turned into an arbitrary-file read.
+    $written_real = realpath($final_path);
+    if (
+        is_link($final_path) || $written_real === false
+        || ($written_real !== $base_real && ! str_starts_with($written_real, $base_real . DIRECTORY_SEPARATOR))
+    ) {
+        @unlink($final_path);
+        return new \WP_Error('rest_conflict', 'Destination was tampered with during replace.', ['status' => 409]);
+    }
+
     // wp_tempnam() creates 0600 files; restore web-readable perms on the final file.
     @chmod($final_path, defined('FS_CHMOD_FILE') ? FS_CHMOD_FILE : 0644);
 
@@ -275,7 +302,16 @@ function handle_replace(\WP_REST_Request $request): \WP_REST_Response|\WP_Error
             return;
         }
         $candidate = path_join($target_real, $rel);
-        if ((realpath($candidate) ?: $candidate) === $final_real) {
+        $cand_real = realpath($candidate);
+        if ($cand_real === false) {
+            return; // nothing on disk to delete
+        }
+        // Explicit containment — do not rely solely on wp_delete_file_from_directory.
+        // (path_join with an absolute $rel returns $rel unchanged.)
+        if ($cand_real !== $target_real && ! str_starts_with($cand_real, $target_real . DIRECTORY_SEPARATOR)) {
+            return;
+        }
+        if ($cand_real === $final_real) {
             return; // never delete the canonical file just written
         }
         wp_delete_file_from_directory($candidate, $target_real);
@@ -411,17 +447,19 @@ function validate_file_type(string $file_path, string $filename, ?string $declar
         );
     }
 
-    // Layer 3 — magic-byte validation (covers every allowed type).
+    // Layer 3 — magic-byte validation. Each signature is offset => expected byte.
+    // WebP requires the RIFF prefix AND the "WEBP" form-type at offset 8 — RIFF
+    // alone also matches WAV/AVI (bytes 4-7 are the file size and are not checked).
     $signatures = [
-        'image/jpeg'      => [0xFF, 0xD8, 0xFF],
-        'image/png'       => [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A],
-        'image/gif'       => [0x47, 0x49, 0x46, 0x38],
-        'image/webp'      => [0x52, 0x49, 0x46, 0x46],
-        'application/pdf' => [0x25, 0x50, 0x44, 0x46],
+        'image/jpeg'      => [0 => 0xFF, 1 => 0xD8, 2 => 0xFF],
+        'image/png'       => [0 => 0x89, 1 => 0x50, 2 => 0x4E, 3 => 0x47, 4 => 0x0D, 5 => 0x0A, 6 => 0x1A, 7 => 0x0A],
+        'image/gif'       => [0 => 0x47, 1 => 0x49, 2 => 0x46, 3 => 0x38],
+        'image/webp'      => [0 => 0x52, 1 => 0x49, 2 => 0x46, 3 => 0x46, 8 => 0x57, 9 => 0x45, 10 => 0x42, 11 => 0x50],
+        'application/pdf' => [0 => 0x25, 1 => 0x50, 2 => 0x44, 3 => 0x46],
     ];
 
     $expected = $signatures[$declared_clean];
-    $needed   = count($expected);
+    $needed   = max(array_keys($expected)) + 1;
 
     $fh = fopen($file_path, 'rb');
     if (! $fh) {
@@ -435,8 +473,8 @@ function validate_file_type(string $file_path, string $filename, ?string $declar
     }
 
     $actual = array_values(unpack('C*', $header));
-    foreach ($expected as $i => $byte) {
-        if ($actual[$i] !== $byte) {
+    foreach ($expected as $offset => $byte) {
+        if (($actual[$offset] ?? null) !== $byte) {
             return new \WP_Error(
                 'rest_forbidden',
                 sprintf('File content does not match type "%s". Upload rejected.', esc_html($declared_clean)),
