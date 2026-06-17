@@ -165,6 +165,8 @@ export interface IWordPressClient {
   updatePost(data: UpdatePostRequest): Promise<WordPressPost>;
   deletePost(id: number, force?: boolean): Promise<{ deleted: boolean; previous?: WordPressPost }>;
   getPostRevisions(id: number): Promise<WordPressPost[]>;
+  getPostRevision(parentId: number, revisionId: number): Promise<WordPressPost>;
+  restorePostRevision(parentId: number, revisionId: number): Promise<WordPressPost>;
 
   // Pages
   getPages(params?: PostQueryParams): Promise<WordPressPage[]>;
@@ -173,6 +175,8 @@ export interface IWordPressClient {
   updatePage(data: UpdatePageRequest): Promise<WordPressPage>;
   deletePage(id: number, force?: boolean): Promise<{ deleted: boolean; previous?: WordPressPage }>;
   getPageRevisions(id: number): Promise<WordPressPage[]>;
+  getPageRevision(parentId: number, revisionId: number): Promise<WordPressPage>;
+  restorePageRevision(parentId: number, revisionId: number): Promise<WordPressPage>;
 
   // Media
   getMedia(params?: MediaQueryParams): Promise<WordPressMedia[]>;

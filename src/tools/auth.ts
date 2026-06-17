@@ -78,7 +78,12 @@ export class AuthTools {
 
   /**
    * Handles the 'wp_test_auth' tool request.
-   * It tests the connection and fetches user details upon success.
+   *
+   * Primary probe: GET /settings — returns 200 for admins/editors and works on
+   * LiteSpeed/Wordfence sites that 403 /users/me. Secondary probe (best-effort):
+   * GET /users/me — only used to enrich the response with the user name/roles;
+   * a 403 there is tolerated so the tool reports success on restricted hosts.
+   *
    * @param client - The WordPressClient instance for the target site.
    * @param params - The parameters for the tool request.
    * @returns A promise that resolves to an MCPToolResponse.
@@ -87,17 +92,31 @@ export class AuthTools {
     client: WordPressClient,
     params: Record<string, unknown>,
   ): Promise<Record<string, unknown>> {
+    const siteConfig = client.config;
     try {
-      await client.ping();
-      const user = await client.getCurrentUser();
-      const siteConfig = client.config;
+      // Primary auth check: GET /settings (authenticated, non-/users endpoint).
+      // LiteSpeed and Wordfence sites block /users/me but allow /settings for admins.
+      await client.getSiteSettings();
+
+      // Secondary: try to get user details for the response — tolerate 403 from
+      // hosts that block /users/me (GXR, Bud, PDL with LiteSpeed rules).
+      let userLine = "N/A";
+      let rolesLine = "N/A";
+      try {
+        const user = await client.getCurrentUser();
+        userLine = `${user.name} (@${user.slug})`;
+        rolesLine = user.roles?.join(", ") || "N/A";
+      } catch {
+        // /users/me blocked — auth still confirmed via /settings above
+        userLine = "(details blocked by host — auth confirmed via /settings)";
+      }
 
       const content =
         "✅ **Authentication successful!**\n\n" +
         `**Site:** ${siteConfig.baseUrl}\n` +
         `**Method:** ${siteConfig.auth.method}\n` +
-        `**User:** ${user.name} (@${user.slug})\n` +
-        `**Roles:** ${user.roles?.join(", ") || "N/A"}\n\n` +
+        `**User:** ${userLine}\n` +
+        `**Roles:** ${rolesLine}\n\n` +
         "Your WordPress connection is working properly.";
 
       return { content };

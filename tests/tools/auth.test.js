@@ -9,6 +9,7 @@ describe("AuthTools", () => {
     // Mock WordPressClient with all required methods
     mockClient = {
       ping: vi.fn(),
+      getSiteSettings: vi.fn().mockResolvedValue({}),
       getCurrentUser: vi.fn(),
       isAuthenticated: true,
       config: {
@@ -90,8 +91,8 @@ describe("AuthTools", () => {
 
   describe("handleTestAuth", () => {
     it("should successfully test authentication with valid client", async () => {
-      // Mock successful authentication
-      mockClient.ping.mockResolvedValue(true);
+      // Primary probe is getSiteSettings (not ping)
+      mockClient.getSiteSettings.mockResolvedValue({ title: "My Site" });
       mockClient.getCurrentUser.mockResolvedValue({
         name: "Test User",
         slug: "testuser",
@@ -108,37 +109,38 @@ describe("AuthTools", () => {
       expect(result.content).toContain("Roles:** administrator, editor");
       expect(result.content).toContain("Your WordPress connection is working properly.");
 
-      expect(mockClient.ping).toHaveBeenCalledTimes(1);
+      expect(mockClient.getSiteSettings).toHaveBeenCalledTimes(1);
       expect(mockClient.getCurrentUser).toHaveBeenCalledTimes(1);
     });
 
-    it("should handle ping failures gracefully", async () => {
-      // Mock ping failure
-      mockClient.ping.mockRejectedValue(new Error("Connection failed"));
+    it("should handle connection failures gracefully", async () => {
+      // Primary probe is getSiteSettings; a failure here means auth failed
+      mockClient.getSiteSettings.mockRejectedValue(new Error("Connection failed"));
 
       await expect(authTools.handleTestAuth(mockClient, {})).rejects.toThrow(
         "Authentication test failed: Connection failed",
       );
 
-      expect(mockClient.ping).toHaveBeenCalledTimes(1);
+      expect(mockClient.getSiteSettings).toHaveBeenCalledTimes(1);
       expect(mockClient.getCurrentUser).not.toHaveBeenCalled();
     });
 
-    it("should handle getCurrentUser failures after successful ping", async () => {
-      // Mock successful ping but failed user fetch
-      mockClient.ping.mockResolvedValue(true);
-      mockClient.getCurrentUser.mockRejectedValue(new Error("User fetch failed"));
+    it("should tolerate getCurrentUser failures and still report auth success", async () => {
+      // getSiteSettings succeeds (primary auth probe) but /users/me is blocked
+      mockClient.getSiteSettings.mockResolvedValue({});
+      mockClient.getCurrentUser.mockRejectedValue(new Error("403 Forbidden"));
 
-      await expect(authTools.handleTestAuth(mockClient, {})).rejects.toThrow(
-        "Authentication test failed: User fetch failed",
-      );
+      // Should NOT reject — auth was confirmed via /settings
+      const result = await authTools.handleTestAuth(mockClient, {});
 
-      expect(mockClient.ping).toHaveBeenCalledTimes(1);
+      expect(result.content).toContain("✅ **Authentication successful!**");
+      // Fallback user line should indicate details were blocked
+      expect(result.content).toContain("auth confirmed via /settings");
+      expect(mockClient.getSiteSettings).toHaveBeenCalledTimes(1);
       expect(mockClient.getCurrentUser).toHaveBeenCalledTimes(1);
     });
 
     it("should handle user with no roles", async () => {
-      mockClient.ping.mockResolvedValue(true);
       mockClient.getCurrentUser.mockResolvedValue({
         name: "Basic User",
         slug: "basicuser",
@@ -151,7 +153,6 @@ describe("AuthTools", () => {
     });
 
     it("should handle user with empty roles array", async () => {
-      mockClient.ping.mockResolvedValue(true);
       mockClient.getCurrentUser.mockResolvedValue({
         name: "Basic User",
         slug: "basicuser",
@@ -165,7 +166,6 @@ describe("AuthTools", () => {
 
     it("should handle different authentication methods in config", async () => {
       mockClient.config.auth.method = "jwt";
-      mockClient.ping.mockResolvedValue(true);
       mockClient.getCurrentUser.mockResolvedValue({
         name: "JWT User",
         slug: "jwtuser",
@@ -305,7 +305,7 @@ describe("AuthTools", () => {
     });
 
     it("should handle unexpected error types in handleTestAuth", async () => {
-      mockClient.ping.mockRejectedValue("String error");
+      mockClient.getSiteSettings.mockRejectedValue("String error");
 
       await expect(authTools.handleTestAuth(mockClient, {})).rejects.toThrow(
         "Authentication test failed: String error",
@@ -354,7 +354,6 @@ describe("AuthTools", () => {
 
   describe("integration scenarios", () => {
     it("should work with real-world user data structures", async () => {
-      mockClient.ping.mockResolvedValue(true);
       mockClient.getCurrentUser.mockResolvedValue({
         ID: 1,
         user_login: "admin",
@@ -392,7 +391,6 @@ describe("AuthTools", () => {
         maxRetries: 3,
       };
 
-      mockClient.ping.mockResolvedValue(true);
       mockClient.getCurrentUser.mockResolvedValue({
         name: "Complex User",
         slug: "complex-user",

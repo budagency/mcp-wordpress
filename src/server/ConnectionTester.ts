@@ -21,6 +21,29 @@ export class ConnectionTester {
   private static logger = LoggerFactory.server().child({ component: "ConnectionTester" });
 
   /**
+   * Probe an authenticated, non-/users endpoint to validate that credentials
+   * are accepted.  Prefers GET /settings (200 for admins) because LiteSpeed
+   * and Wordfence rules commonly 403 /users/me while allowing /settings.
+   * Falls back to a public ping if /settings is unavailable (e.g. site with
+   * restricted settings API).
+   */
+  private static async probeAuth(client: WordPressClient): Promise<void> {
+    try {
+      // Primary: GET /wp-json/wp/v2/settings — authenticated, not a /users endpoint
+      await client.getSiteSettings();
+    } catch (_settingsError) {
+      if (ConnectionTester.isAuthenticationError(_settingsError)) {
+        // 401/403 from /settings = genuinely not authenticated
+        throw _settingsError;
+      }
+      // /settings failed for non-auth reasons (e.g. restricted by capability on some
+      // minimal installs) — fall back to basic connectivity ping so we don't
+      // falsely report failure on reachable, authenticated sites.
+      await client.ping();
+    }
+  }
+
+  /**
    * Test connections to all configured WordPress sites with timeout and concurrency control
    */
   public static async testClientConnections(
@@ -45,13 +68,13 @@ export class ConnectionTester {
       const batchPromises = batch.map(async ([siteId, client]) => {
         const startTime = Date.now();
         try {
-          // Add timeout to ping operation (skip timeout in tests to avoid timer issues)
+          // Probe an authenticated endpoint (not /users/me) — see probeAuth() above.
+          // Skip the timeout wrapper in tests to avoid timer issues.
           if (ConfigHelpers.isTest()) {
-            // In test environment, just run the ping without timeout to avoid Jest timer issues
-            await client.ping();
+            await ConnectionTester.probeAuth(client);
           } else {
             await Promise.race([
-              client.ping(),
+              ConnectionTester.probeAuth(client),
               new Promise((_, reject) => setTimeout(() => reject(new Error("Connection timeout")), timeout)),
             ]);
           }
@@ -111,12 +134,14 @@ export class ConnectionTester {
   }
 
   /**
-   * Perform health check for a specific client with timeout
+   * Perform health check for a specific client with timeout.
+   * Uses an authenticated non-/users endpoint (GET /settings) as the primary
+   * probe so that LiteSpeed/Wordfence sites that 403 /users/me still pass.
    */
   public static async healthCheck(client: WordPressClient, siteId?: string, timeout: number = 3000): Promise<boolean> {
     try {
       await Promise.race([
-        client.ping(),
+        ConnectionTester.probeAuth(client),
         new Promise((_, reject) => setTimeout(() => reject(new Error("Health check timeout")), timeout)),
       ]);
 

@@ -33,7 +33,7 @@ describe("MediaTools", () => {
     it("should return an array of media tools", () => {
       const tools = mediaTools.getTools();
       expect(Array.isArray(tools)).toBe(true);
-      expect(tools).toHaveLength(5);
+      expect(tools).toHaveLength(6);
 
       const toolNames = tools.map((tool) => tool.name);
       expect(toolNames).toContain("wp_list_media");
@@ -41,6 +41,7 @@ describe("MediaTools", () => {
       expect(toolNames).toContain("wp_upload_media");
       expect(toolNames).toContain("wp_update_media");
       expect(toolNames).toContain("wp_delete_media");
+      expect(toolNames).toContain("wp_replace_media");
     });
 
     it("should have proper tool definitions", () => {

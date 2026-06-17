@@ -49,8 +49,8 @@ export class ToolRegistry {
     Object.values(Tools).forEach((ToolClass) => {
       let toolInstance: { getTools(): unknown[] };
 
-      // Cache and Performance tools need the clients map
-      if (ToolClass.name === "CacheTools" || ToolClass.name === "PerformanceTools") {
+      // Cache, Performance, and Bulk tools need the multi-site clients map
+      if (ToolClass.name === "CacheTools" || ToolClass.name === "PerformanceTools" || ToolClass.name === "BulkTools") {
         toolInstance = new ToolClass(this.wordpressClients);
       } else {
         toolInstance = new (ToolClass as new () => { getTools(): unknown[] })();

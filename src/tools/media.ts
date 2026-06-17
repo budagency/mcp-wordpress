@@ -1,5 +1,7 @@
 import * as fs from "fs";
+import * as path from "path";
 import { WordPressClient } from "@/client/api.js";
+import { getMimeTypeFromPath } from "@/client/operations/media.js";
 import type { MCPToolSchema } from "@/types/mcp.js";
 import { MediaQueryParams, UpdateMediaRequest, UploadMediaRequest } from "@/types/wordpress.js";
 import { getErrorMessage } from "@/utils/error.js";
@@ -184,6 +186,29 @@ export class MediaTools {
         },
         handler: this.handleDeleteMedia.bind(this),
       },
+      {
+        name: "wp_replace_media",
+        description:
+          "Replaces the binary of an existing media attachment in place, keeping the same attachment ID, " +
+          "filename, and all existing URLs. Theme code and posts keyed to the attachment ID continue to work " +
+          "without any database or template changes. Requires the Bud Media Replace plugin to be active on " +
+          "the target site (plugins/bud-media-replace/). Validates magic bytes before upload.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            id: {
+              type: "number",
+              description: "The ID of the existing attachment to replace.",
+            },
+            file_path: {
+              type: "string",
+              description: "The local absolute path to the new file whose bytes should replace the attachment.",
+            },
+          },
+          required: ["id", "file_path"],
+        } satisfies MCPToolSchema,
+        handler: this.handleReplaceMedia.bind(this),
+      },
     ];
   }
 
@@ -261,6 +286,49 @@ export class MediaTools {
       return `✅ Media item ${id} has been ${action}`;
     } catch (_error) {
       throw new Error(`Failed to delete media: ${getErrorMessage(_error)}`);
+    }
+  }
+
+  public async handleReplaceMedia(client: WordPressClient, params: Record<string, unknown>): Promise<unknown> {
+    const id = parseId(params);
+    const { file_path: rawPath } = toolParams<{ file_path: string }>(params);
+
+    try {
+      // Validate and sanitise the path (mirrors handleUploadMedia).
+      const allowedBasePath = process.env.MCP_UPLOAD_BASE_DIR || "/";
+      const safePath = validateFilePath(rawPath, allowedBasePath);
+
+      try {
+        await fs.promises.access(safePath);
+      } catch (_e) {
+        throw new Error(`File not found at path: ${safePath}`);
+      }
+
+      // Read file bytes via handle to avoid TOCTOU race (mirrors uploadMedia).
+      const fileHandle = await fs.promises.open(safePath, "r");
+      let fileBuffer: Buffer;
+      try {
+        const stats = await fileHandle.stat();
+        const maxSize = 10 * 1024 * 1024; // 10 MB
+        if (stats.size > maxSize) {
+          throw new Error(
+            `File too large: ${(stats.size / 1024 / 1024).toFixed(2)}MB. Maximum allowed: ${maxSize / 1024 / 1024}MB`,
+          );
+        }
+        fileBuffer = await fileHandle.readFile();
+      } finally {
+        await fileHandle.close();
+      }
+
+      const filename = path.basename(safePath);
+      const mimeType = getMimeTypeFromPath(safePath);
+
+      // replaceMedia handles magic-byte validation + the bud/v1 REST call.
+      const media = await client.replaceMedia(id, fileBuffer, filename, mimeType);
+
+      return `✅ Media ${id} replaced successfully.\n` + `- URL:  ${media.source_url}\n` + `- MIME: ${media.mime_type}`;
+    } catch (_error) {
+      throw new Error(`Failed to replace media: ${getErrorMessage(_error)}`);
     }
   }
 }

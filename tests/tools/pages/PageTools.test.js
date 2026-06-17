@@ -172,7 +172,7 @@ describe("PageTools", () => {
     it("should get a page by ID", async () => {
       const result = await pageTools.handleGetPage(mockClient, { id: 1 });
 
-      expect(mockClient.getPage).toHaveBeenCalledWith(1);
+      expect(mockClient.getPage).toHaveBeenCalledWith(1, "view");
       expect(typeof result).toBe("string");
       expect(result).toContain("Test Page");
       expect(result).toContain("Page Details (ID: 1)");

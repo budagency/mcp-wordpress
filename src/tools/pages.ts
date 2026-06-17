@@ -46,7 +46,9 @@ export class PageTools {
       },
       {
         name: "wp_get_page",
-        description: "Retrieves a single page by its ID, optionally including full content for editing.",
+        description:
+          "Retrieves a single page by its ID, optionally including full content for editing.\n\n" +
+          "• Raw content for editing: `wp_get_page --id=123 --raw=true` (returns content.raw + content.rendered + title.raw)",
         inputSchema: {
           type: "object",
           properties: {
@@ -57,6 +59,13 @@ export class PageTools {
             include_content: {
               type: "boolean",
               description: "If true, includes the full HTML content of the page. Default: false",
+            },
+            raw: {
+              type: "boolean",
+              description:
+                "If true, fetches the page with context=edit and returns BOTH content.raw (unprocessed source) " +
+                "and content.rendered (expanded HTML), plus title.raw. Use this when you need to edit raw content. " +
+                "Requires authentication as an editor or administrator. Default: false",
             },
           },
           required: ["id"],
@@ -170,9 +179,10 @@ export class PageTools {
 
   public async handleGetPage(client: WordPressClient, params: Record<string, unknown>): Promise<unknown> {
     const id = parseId(params);
-    const { include_content = false } = params as { include_content?: boolean };
+    const { include_content = false, raw = false } = params as { include_content?: boolean; raw?: boolean };
     try {
-      const page = await client.getPage(id);
+      const context = raw ? "edit" : "view";
+      const page = await client.getPage(id, context);
       let content =
         `**Page Details (ID: ${page.id})**\n\n` +
         `- **Title:** ${page.title.rendered}\n` +
@@ -180,7 +190,17 @@ export class PageTools {
         `- **Link:** ${page.link}\n` +
         `- **Date:** ${new Date(page.date).toLocaleString()}`;
 
-      if (include_content) {
+      if (raw) {
+        // Return both raw (editable source) and rendered (expanded HTML) plus raw title
+        const rawTitle = page.title?.raw;
+        const rawBody = page.content?.raw;
+        if (rawTitle !== undefined) {
+          content += `\n\n**Title (raw):**\n${rawTitle}`;
+        }
+        content +=
+          `\n\n**Content (raw — edit this):**\n${rawBody ?? "(not available — ensure context=edit is supported)"}` +
+          `\n\n**Content (rendered — for reference only):**\n${page.content.rendered || "(empty)"}`;
+      } else if (include_content) {
         content += `\n\n**Content:**\n\n` + `${page.content.rendered || "(empty)"}`;
       }
 
