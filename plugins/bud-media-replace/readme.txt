@@ -38,25 +38,45 @@ Two formats are accepted:
        Content-Disposition: attachment; filename="badge.png"
        Body:                <raw bytes>
 
+=== Scope ===
+
+Images and PDFs only (`image/jpeg`, `image/png`, `image/gif`, `image/webp`,
+`application/pdf`) — the types this endpoint can validate by content. The
+replacement must be the SAME type as the original attachment (the filename and
+URL are preserved, so a logo/badge/brochure swap is always same-type).
+
 === Security ===
 
-- Permission callback: `current_user_can('upload_files')` — works with
-  WordPress Application Passwords (Basic Auth). NOT `is_user_logged_in()`,
-  which returns false for non-cookie sessions.
-- Magic-byte validation rejects disguised uploads (e.g. PHP renamed .jpg).
-- Sanitizes all filenames and MIME types with WordPress core functions.
-- Does not allow path traversal; always writes to the existing attachment path.
+- **Authorization (two layers):** `current_user_can('upload_files')` AND
+  `current_user_can('edit_post', $id)` on the target attachment — App-Password
+  (Basic Auth) compatible; blocks overwriting another user's media. NOT
+  `is_user_logged_in()` (false for non-cookie sessions).
+- **Uploads-dir confinement:** the destination directory is realpath-resolved and
+  must live under the uploads basedir; symlinked attachments are refused, so a
+  poisoned `_wp_attached_file` cannot become an arbitrary file write/delete.
+- **Content-based type check:** the real MIME is detected with `finfo` on the
+  uploaded bytes (the client-declared MIME is never trusted) and must equal the
+  original attachment MIME. Fails closed if the `fileinfo` extension is missing.
+- **Strict allowlist + magic bytes:** only the five types above, each verified by
+  its byte signature; `wp_check_filetype_and_ext()` cross-checks the extension.
+- **Size cap:** the raw body is streamed to disk with a `wp_max_upload_size()`
+  byte cap (no unbounded in-memory read); multipart size is checked too.
+- **Atomic replace:** the new file is staged inside the validated target dir and
+  swapped in with an atomic same-directory `rename()` (which replaces a symlink
+  entry rather than following it) after a final TOCTOU re-check — `copy()` is
+  never used on the destination path.
 
 === File replacement sequence ===
 
-1. Validate attachment ID is an `attachment` post type.
-2. Accept file from $_FILES['file'] or raw php://input.
-3. Validate magic bytes against declared MIME type.
-4. Preserve the original filename — overwrite the existing file at its path.
-5. Delete stale image-size derivatives (thumbnails etc.).
-6. `update_attached_file($id, $path)` to refresh the DB record.
-7. `wp_generate_attachment_metadata($id, $path)` to regenerate sizes.
-8. `wp_update_attachment_metadata($id, $meta)` to save.
+1. Validate the attachment and require `fileinfo`.
+2. Confine to the uploads directory; reject symlinks.
+3. Receive bytes ($_FILES, or a size-capped php://input stream).
+4. Detect the real MIME with finfo; require it to equal the original.
+5. Allowlist + extension + magic-byte validation.
+6. Stage the new file in the target dir; atomic same-dir rename into place.
+7. Delete the old size derivatives, full-size `original_image`, `thumb`, and
+   `_wp_attachment_backup_sizes` (confined; never the new file).
+8. `update_attached_file()` + `wp_generate_attachment_metadata()` + save.
 9. Return `{ id, source_url, media_details, mime }`.
 
 == Deployment & Activation ==
@@ -107,6 +127,28 @@ To ensure the plugin cannot be accidentally deactivated, drop it into:
 Note: mu-plugins cannot be activated/deactivated from the admin UI.
 
 == Changelog ==
+
+= 1.4.0 =
+* Security/privacy: on replace, also delete the full-size `original_image`,
+  legacy `thumb`, and `_wp_attachment_backup_sizes` so an old copy is never left
+  publicly reachable; store fresh (not stale) metadata if regeneration fails.
+
+= 1.3.0 =
+* Hardening (Codex review #2): stage + atomic same-directory rename (no copy onto
+  the destination — closes a symlink-follow TOCTOU); detect the real MIME with
+  finfo and require it to equal the original (client MIME no longer trusted);
+  restrict the allowlist to images + PDF (every type magic-byte verified); fail
+  closed without fileinfo; restore web-readable perms after rename.
+
+= 1.2.0 =
+* Hardening (Codex review #1): confine all file ops to the uploads dir + reject
+  symlinks; `wp_delete_file_from_directory()` for size files; validate the final
+  destination filename; `is_uploaded_file()` on the multipart path; stream the
+  raw body with a size cap.
+
+= 1.1.0 =
+* Security: per-attachment ownership check (`edit_post`); strict MIME allowlist +
+  WordPress-native detection in addition to magic bytes.
 
 = 1.0.0 =
 * Initial release.
