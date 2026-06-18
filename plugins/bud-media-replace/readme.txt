@@ -142,6 +142,13 @@ Note: mu-plugins cannot be activated/deactivated from the admin UI.
 
 == Changelog ==
 
+= 1.6.1 =
+* Fix: PHP 8.0/8.1 compatibility. validate_file_type() declared a standalone `true`
+  return type (`true|WP_Error`), which is only valid on PHP 8.2+ and caused a fatal
+  parse error ("plugin triggered a fatal error" on activation) on 8.0/8.1 hosts.
+  Changed to `bool|WP_Error` (returns true on success; callers use is_wp_error()).
+  The plugin now genuinely matches its "Requires PHP: 8.0" header.
+
 = 1.6.0 =
 * fileinfo no longer hard-required (it is absent on some CloudLinux/ea-php hosts,
   which made the endpoint 500). Type detection now prefers fileinfo and falls back

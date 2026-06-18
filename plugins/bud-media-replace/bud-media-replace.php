@@ -3,7 +3,7 @@
  * Plugin Name: Bud Media Replace
  * Plugin URI:  https://bud.agency
  * Description: Headless REST route to replace a media attachment's binary in place, keeping the same attachment ID, filename, and all existing URLs. Images and PDFs only. Requires PHP 8.0+.
- * Version:     1.6.0
+ * Version:     1.6.1
  * Author:      Bud Agency
  * Author URI:  https://bud.agency
  * License:     GPL-2.0-or-later
@@ -409,9 +409,9 @@ function handle_replace(\WP_REST_Request $request): \WP_REST_Response|\WP_Error
  * @param string      $filename  FINAL destination filename (extension checked matches
  *                               the file that will actually exist on disk).
  * @param string|null $declared  DETECTED MIME (from finfo or magic bytes), passed by the caller.
- * @return true|\WP_Error
+ * @return bool|\WP_Error  true on success (PHP 8.0-compatible; a standalone `true` type needs 8.2).
  */
-function validate_file_type(string $file_path, string $filename, ?string $declared): true|\WP_Error
+function validate_file_type(string $file_path, string $filename, ?string $declared): bool|\WP_Error
 {
     // Layer 1 — strict allowlist. Only content-validatable types are permitted.
     // (SVG excluded — needs a sanitizer; office/audio/video excluded — cannot be
