@@ -54,9 +54,13 @@ URL are preserved, so a logo/badge/brochure swap is always same-type).
 - **Uploads-dir confinement:** the destination directory is realpath-resolved and
   must live under the uploads basedir; symlinked attachments are refused, so a
   poisoned `_wp_attached_file` cannot become an arbitrary file write/delete.
-- **Content-based type check:** the real MIME is detected with `finfo` on the
-  uploaded bytes (the client-declared MIME is never trusted) and must equal the
-  original attachment MIME. Fails closed if the `fileinfo` extension is missing.
+- **Content-based type check:** the real type is detected from the bytes — via
+  `finfo` (libmagic) when available, else by STRUCTURAL parsing (`getimagesize()`
+  for images, `%PDF` header + `startxref`/`%%EOF` trailer for PDF). The client-
+  declared MIME is never trusted, and the detected type must equal the original
+  attachment's. `fileinfo` is preferred but no longer required (some CloudLinux/
+  ea-php hosts omit it); the fallback is structural, not a byte-prefix match, so
+  prefix-only polyglots (e.g. `GIF8<?php`) are rejected.
 - **Strict allowlist + magic bytes:** only the five types above, each verified by
   its byte signature; `wp_check_filetype_and_ext()` cross-checks the extension.
 - **Size cap:** the raw body is streamed to disk with a `wp_max_upload_size()`
@@ -78,7 +82,7 @@ URL are preserved, so a logo/badge/brochure swap is always same-type).
 
 === File replacement sequence ===
 
-1. Validate the attachment and require `fileinfo`.
+1. Validate the attachment; detect the real type (`fileinfo`, else structural).
 2. Confine to the uploads directory; reject symlinks.
 3. Receive bytes ($_FILES, or a size-capped php://input stream).
 4. Detect the real MIME with finfo; require it to equal the original.
@@ -137,6 +141,19 @@ To ensure the plugin cannot be accidentally deactivated, drop it into:
 Note: mu-plugins cannot be activated/deactivated from the admin UI.
 
 == Changelog ==
+
+= 1.6.0 =
+* fileinfo no longer hard-required (it is absent on some CloudLinux/ea-php hosts,
+  which made the endpoint 500). Type detection now prefers fileinfo and falls back
+  to STRUCTURAL parsing when it is missing: getimagesize() for images (parses real
+  image structure, not a byte prefix) and a %PDF header + startxref/%%EOF trailer
+  check for PDF. Prefix-only polyglots ("GIF8<?php", "%PDF<script>") are rejected
+  on fileinfo-less hosts. Tightened the GIF magic signature (require the 87a/89a
+  "a") and made mime_signatures() the single source for the Layer-3 byte check.
+  Dual-reviewed (Codex gpt-5.5 + GLM-5.2): the fallback is confirmed no weaker than
+  the fileinfo path (stricter for PDF, equivalent for images). The valid-image/PDF-
+  with-embedded-PHP residual is unchanged and identical to core WordPress — keep
+  PHP execution disabled in wp-content/uploads/ (see Residual considerations).
 
 = 1.5.0 =
 * Hardening (GLM/z.ai review): guard the cross-device copy() fallback against a
