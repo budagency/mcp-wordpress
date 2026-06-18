@@ -19,3 +19,4 @@ export { default as MenuTools } from "./menus.js";
 export { default as PluginTools } from "./plugins.js";
 export { default as BulkTools } from "./bulk.js";
 export { default as ACFBlockTools } from "./acf-blocks.js";
+export { default as ACFFieldTools } from "./acf-fields.js";
