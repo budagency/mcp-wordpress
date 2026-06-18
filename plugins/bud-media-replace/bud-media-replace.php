@@ -3,7 +3,7 @@
  * Plugin Name: Bud Media Replace
  * Plugin URI:  https://bud.agency
  * Description: Headless REST route to replace a media attachment's binary in place, keeping the same attachment ID, filename, and all existing URLs. Images and PDFs only. Requires PHP 8.0+.
- * Version:     1.5.0
+ * Version:     1.6.0
  * Author:      Bud Agency
  * Author URI:  https://bud.agency
  * License:     GPL-2.0-or-later
@@ -87,11 +87,10 @@ function handle_replace(\WP_REST_Request $request): \WP_REST_Response|\WP_Error
         return new \WP_Error('rest_server_error', 'Could not retrieve the existing file path for this attachment.', ['status' => 500]);
     }
 
-    // fileinfo is required: without it, content-based type detection is impossible
-    // and wp_check_filetype_and_ext() degrades to (spoofable) extension-only checks.
-    if (! extension_loaded('fileinfo')) {
-        return new \WP_Error('rest_server_error', 'The PHP fileinfo extension is required for secure media replacement.', ['status' => 500]);
-    }
+    // wp_tempnam(), wp_delete_file_from_directory(), wp_handle_upload() etc. live in
+    // wp-admin/includes/file.php, which is NOT loaded during REST requests by default.
+    // Load it up front so the temp/staging calls below (steps 3 and 7) are defined.
+    require_once ABSPATH . 'wp-admin/includes/file.php';
 
     // --- 2. SECURITY: confine all filesystem ops to the uploads directory ------
     // Resolve real paths, require the attachment's directory under the uploads
@@ -192,21 +191,40 @@ function handle_replace(\WP_REST_Request $request): \WP_REST_Response|\WP_Error
     //         client-declared MIME) and require it to equal the original. The
     //         filename/extension/URL are preserved, so only a same-type swap is
     //         valid (a logo/badge/brochure replacement is always same-type).
+    //
+    //         Type detection is content-based two ways: fileinfo (libmagic) when the
+    //         extension is available, else the magic-byte signatures in
+    //         mime_signatures() (some managed/CloudLinux/ea-php builds omit fileinfo).
+    //         Either way the client-declared MIME is never trusted, and the strict
+    //         magic-byte allowlist in validate_file_type() is enforced regardless.
     $orig_mime = sanitize_mime_type(strtolower((string) get_post_mime_type($id)));
 
-    $finfo       = finfo_open(FILEINFO_MIME_TYPE);
-    $actual_mime = $finfo ? finfo_file($finfo, $tmp_path) : false;
-    if ($finfo) {
-        finfo_close($finfo);
+    $actual_mime = false;
+    if (extension_loaded('fileinfo')) {
+        $finfo       = finfo_open(FILEINFO_MIME_TYPE);
+        $actual_mime = $finfo ? finfo_file($finfo, $tmp_path) : false;
+        if ($finfo) {
+            finfo_close($finfo);
+        }
     }
-    if (! is_string($actual_mime) || $actual_mime === '') {
+    if (is_string($actual_mime) && $actual_mime !== '') {
+        $actual_mime = sanitize_mime_type(strtolower($actual_mime));
+        // Normalise a couple of common libmagic aliases.
+        $aliases     = ['image/x-png' => 'image/png', 'application/x-pdf' => 'application/pdf'];
+        $actual_mime = $aliases[$actual_mime] ?? $actual_mime;
+    } else {
+        // fileinfo unavailable or inconclusive — derive the type from the file's
+        // actual STRUCTURE (getimagesize parses the image; PDF needs header + EOF),
+        // not a byte prefix, so polyglots like "GIF8<?php…" / "%PDF<script>" fail.
+        if (extension_loaded('fileinfo')) {
+            error_log('bud-media-replace: fileinfo present but could not type the upload; using structural detection.');
+        }
+        $actual_mime = detect_mime_strict($tmp_path) ?? '';
+    }
+    if ($actual_mime === '') {
         @unlink($tmp_path);
         return new \WP_Error('rest_forbidden', 'Could not determine the type of the uploaded file.', ['status' => 415]);
     }
-    $actual_mime = sanitize_mime_type(strtolower($actual_mime));
-    // Normalise a couple of common libmagic aliases.
-    $aliases     = ['image/x-png' => 'image/png', 'application/x-pdf' => 'application/pdf'];
-    $actual_mime = $aliases[$actual_mime] ?? $actual_mime;
 
     if ($orig_mime === '' || $actual_mime !== $orig_mime) {
         @unlink($tmp_path);
@@ -383,23 +401,18 @@ function handle_replace(\WP_REST_Request $request): \WP_REST_Response|\WP_Error
  * Validates a file's type. Images and PDFs only — the types this endpoint can
  * content-validate end to end.
  *
- * Layer 0 — fileinfo required (checked by the caller too).
  * Layer 1 — strict allowlist (image/* + PDF; every entry has a magic-byte signature).
  * Layer 2 — WordPress-native detection via wp_check_filetype_and_ext() (filename + contents).
- * Layer 3 — magic-byte signature check.
+ * Layer 3 — magic-byte signature check (content-based; needs no fileinfo extension).
  *
  * @param string      $file_path Absolute path to the temp file.
  * @param string      $filename  FINAL destination filename (extension checked matches
  *                               the file that will actually exist on disk).
- * @param string|null $declared  DETECTED MIME (from finfo), passed by the caller.
+ * @param string|null $declared  DETECTED MIME (from finfo or magic bytes), passed by the caller.
  * @return true|\WP_Error
  */
 function validate_file_type(string $file_path, string $filename, ?string $declared): true|\WP_Error
 {
-    if (! extension_loaded('fileinfo')) {
-        return new \WP_Error('rest_server_error', 'The PHP fileinfo extension is required for secure media replacement.', ['status' => 500]);
-    }
-
     // Layer 1 — strict allowlist. Only content-validatable types are permitted.
     // (SVG excluded — needs a sanitizer; office/audio/video excluded — cannot be
     // reliably content-validated here.)
@@ -447,16 +460,10 @@ function validate_file_type(string $file_path, string $filename, ?string $declar
         );
     }
 
-    // Layer 3 — magic-byte validation. Each signature is offset => expected byte.
-    // WebP requires the RIFF prefix AND the "WEBP" form-type at offset 8 — RIFF
-    // alone also matches WAV/AVI (bytes 4-7 are the file size and are not checked).
-    $signatures = [
-        'image/jpeg'      => [0 => 0xFF, 1 => 0xD8, 2 => 0xFF],
-        'image/png'       => [0 => 0x89, 1 => 0x50, 2 => 0x4E, 3 => 0x47, 4 => 0x0D, 5 => 0x0A, 6 => 0x1A, 7 => 0x0A],
-        'image/gif'       => [0 => 0x47, 1 => 0x49, 2 => 0x46, 3 => 0x38],
-        'image/webp'      => [0 => 0x52, 1 => 0x49, 2 => 0x46, 3 => 0x46, 8 => 0x57, 9 => 0x45, 10 => 0x42, 11 => 0x50],
-        'application/pdf' => [0 => 0x25, 1 => 0x50, 2 => 0x44, 3 => 0x46],
-    ];
+    // Layer 3 — magic-byte validation (defence-in-depth). The authoritative type was
+    // already established by finfo or by structural parsing (detect_mime_strict);
+    // this re-checks the byte signature for the resolved type. offset => expected byte.
+    $signatures = mime_signatures();
 
     $expected = $signatures[$declared_clean];
     $needed   = max(array_keys($expected)) + 1;
@@ -484,4 +491,88 @@ function validate_file_type(string $file_path, string $filename, ?string $declar
     }
 
     return true;
+}
+
+/**
+ * Magic-byte signatures for the allowlisted types (offset => expected byte).
+ * Used as the Layer 3 defence-in-depth magic-byte check in validate_file_type().
+ * GIF requires "GIF8" + the "a" terminator at offset 5 (covers GIF87a/GIF89a);
+ * offset 4 (the 7/9 version digit) is intentionally unconstrained. WebP requires
+ * the RIFF prefix AND the "WEBP" form-type at offset 8 — RIFF alone also matches
+ * WAV/AVI (bytes 4-7 are the file size and are intentionally not checked).
+ *
+ * @return array<string, array<int,int>>
+ */
+function mime_signatures(): array
+{
+    return [
+        'image/jpeg'      => [0 => 0xFF, 1 => 0xD8, 2 => 0xFF],
+        'image/png'       => [0 => 0x89, 1 => 0x50, 2 => 0x4E, 3 => 0x47, 4 => 0x0D, 5 => 0x0A, 6 => 0x1A, 7 => 0x0A],
+        'image/gif'       => [0 => 0x47, 1 => 0x49, 2 => 0x46, 3 => 0x38, 5 => 0x61],
+        'image/webp'      => [0 => 0x52, 1 => 0x49, 2 => 0x46, 3 => 0x46, 8 => 0x57, 9 => 0x45, 10 => 0x42, 11 => 0x50],
+        'application/pdf' => [0 => 0x25, 1 => 0x50, 2 => 0x44, 3 => 0x46],
+    ];
+}
+
+/**
+ * Structural type detection for hosts WITHOUT the fileinfo extension (some
+ * managed/CloudLinux/ea-php builds omit it). Unlike a byte-prefix match, this
+ * requires the file to actually PARSE as the claimed type, so polyglots that
+ * merely begin with a valid signature (e.g. "GIF8<?php…", "%PDF<script>") are
+ * rejected. Returns one of the allowlisted MIME types, or null (fail closed).
+ * The client-declared MIME is never consulted.
+ *
+ *  - Images: getimagesize() reads the real image structure (dimensions/type), not
+ *    just a prefix; restricted to the four allowed raster types.
+ *  - PDF: strict %PDF-x.y header AND a %%EOF marker in the trailer.
+ */
+function detect_mime_strict(string $file_path): ?string
+{
+    $info = @getimagesize($file_path);
+    if (is_array($info) && ! empty($info[2])) {
+        $mime        = image_type_to_mime_type((int) $info[2]);
+        $img_allowed = ['image/jpeg' => true, 'image/png' => true, 'image/gif' => true, 'image/webp' => true];
+        return isset($img_allowed[$mime]) ? $mime : null; // a real image, but not an allowed type
+    }
+
+    if (is_pdf_strict($file_path)) {
+        return 'application/pdf';
+    }
+
+    return null;
+}
+
+/**
+ * Strict-ish PDF check (no full parser): require a "%PDF-x.y" header at the very
+ * start AND a "%%EOF" marker within the trailer. Rejects "%PDF<script>" stubs and
+ * truncated files. Not a sanitizer — a same-type PDF replacement is permitted by
+ * design (see readme: PDFs may carry embedded payloads, same as any WP PDF upload).
+ */
+function is_pdf_strict(string $file_path): bool
+{
+    clearstatcache(true, $file_path);
+    $size = @filesize($file_path);
+    if ($size === false || $size < 8) {
+        return false;
+    }
+    $fh = @fopen($file_path, 'rb');
+    if (! $fh) {
+        return false;
+    }
+    $head     = fread($fh, 1024);
+    $tail_len = (int) min(2048, $size);
+    if (fseek($fh, -$tail_len, SEEK_END) !== 0) {
+        fclose($fh);
+        return false;
+    }
+    $tail = fread($fh, $tail_len);
+    fclose($fh);
+
+    // Require the %PDF-x.y header at offset 0 AND a cross-reference trailer
+    // (startxref + %%EOF) near the end — every well-formed PDF has both. This
+    // rejects "%PDF-1.4\n<garbage>\n%%EOF" wrappers that lack a real xref table.
+    return is_string($head) && is_string($tail)
+        && preg_match('/\A%PDF-\d\.\d/', $head) === 1
+        && str_contains($tail, 'startxref')
+        && str_contains($tail, '%%EOF');
 }
