@@ -18,3 +18,4 @@ export { default as ContentTools } from "./content.js";
 export { default as MenuTools } from "./menus.js";
 export { default as PluginTools } from "./plugins.js";
 export { default as BulkTools } from "./bulk.js";
+export { default as ACFBlockTools } from "./acf-blocks.js";
