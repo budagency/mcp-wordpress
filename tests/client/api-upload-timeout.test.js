@@ -8,6 +8,17 @@ import { WordPressClient } from "@/client/api.js";
 import nock from "nock";
 import fs from "fs";
 
+/**
+ * Tests below intentionally mock a response `.delay()` longer than the
+ * client's own request timeout, so the client's AbortController wins the
+ * race and rejects first. But nock schedules that delay via its own
+ * independent timer, so — left alone — it fires afterward and tries to
+ * deliver a response to a request nock considers already handled, throwing
+ * an "already handled" InterceptorError asynchronously once the delay
+ * elapses. `nock.abortPendingRequests()` (called in afterEach) clears that
+ * still-pending timer before it ever fires, so the race never happens.
+ */
+
 describe("WordPress API Client Upload Timeout", () => {
   let client;
   const testBaseUrl = "https://test-wordpress.com";
@@ -42,6 +53,7 @@ describe("WordPress API Client Upload Timeout", () => {
   });
 
   afterEach(() => {
+    nock.abortPendingRequests();
     nock.cleanAll();
     vi.restoreAllMocks();
   });
@@ -49,12 +61,10 @@ describe("WordPress API Client Upload Timeout", () => {
   describe("uploadFile method timeout behavior", () => {
     it("should use custom timeout when provided in options", async () => {
       const customTimeout = 100; // Very short timeout for fast testing
+      const mockDelay = customTimeout + 50; // Short delay but still exceeds timeout
 
       // Mock slow response that exceeds custom timeout
-      nock(testBaseUrl)
-        .post("/wp-json/wp/v2/media")
-        .delay(customTimeout + 50) // Short delay but still exceeds timeout
-        .reply(200, { id: 123, title: "uploaded" });
+      nock(testBaseUrl).post("/wp-json/wp/v2/media").delay(mockDelay).reply(200, { id: 123, title: "uploaded" });
 
       await expect(
         client.uploadFile(testFile, "test.txt", "text/plain", {}, { timeout: customTimeout }),
@@ -216,15 +226,57 @@ describe("WordPress API Client Upload Timeout", () => {
     });
   });
 
+  describe("Content-Type header integrity", () => {
+    it("should send a single clean Content-Type header matching the file MIME type (regression: form-data package used to collide with the default JSON header)", async () => {
+      let capturedHeaders;
+
+      nock(testBaseUrl)
+        .post("/wp-json/wp/v2/media")
+        .reply(function () {
+          capturedHeaders = this.req.headers;
+          return [200, { id: 321, title: "uploaded" }];
+        });
+
+      await client.uploadFile(testFile, "test.txt", "text/plain");
+
+      const contentTypeKeys = Object.keys(capturedHeaders).filter((key) => key.toLowerCase() === "content-type");
+      expect(contentTypeKeys).toHaveLength(1);
+
+      // Raw-binary transport: the file's own MIME type is sent verbatim (no JSON
+      // collision, no multipart boundary); the filename rides in Content-Disposition.
+      const contentType = capturedHeaders[contentTypeKeys[0]];
+      expect(contentType).not.toContain("application/json");
+      expect(contentType).not.toContain("multipart/form-data");
+      expect(contentType).toContain("text/plain");
+
+      const dispositionKeys = Object.keys(capturedHeaders).filter(
+        (key) => key.toLowerCase() === "content-disposition",
+      );
+      expect(dispositionKeys).toHaveLength(1);
+      expect(capturedHeaders[dispositionKeys[0]]).toContain('filename="test.txt"');
+    });
+  });
+
   describe("upload permission handling", () => {
-    it("should handle network connection errors during upload", async () => {
-      // Media CREATE is non-retryable (retries:1 in uploadFile) to prevent
-      // duplicate attachments. A single interceptor covers the single attempt.
-      nock(testBaseUrl).post("/wp-json/wp/v2/media").replyWithError("socket hang up");
+    it("should handle network connection errors during upload without retrying (regression: retrying a mutating upload risks duplicate media)", async () => {
+      // Uploads must never retry (retries:1 in uploadFile): a retry after a
+      // network error can't tell whether the first attempt actually succeeded
+      // server-side, so retrying risks creating duplicate media items. Only mock
+      // a single attempt; a second, un-mocked attempt would need its own interceptor.
+      const firstAttempt = nock(testBaseUrl).post("/wp-json/wp/v2/media").replyWithError("socket hang up");
+
+      // If a regression reintroduces retries, the 2nd attempt would hit this
+      // interceptor instead of running out of mocks — assert it's never used.
+      const unexpectedRetry = nock(testBaseUrl)
+        .post("/wp-json/wp/v2/media")
+        .reply(200, { id: -1, title: "unexpected retry" });
 
       await expect(client.uploadFile(testFile, "test.txt", "text/plain", {}, { timeout: 1000 })).rejects.toThrow(
         /Network connection lost during request/,
       );
+
+      expect(firstAttempt.isDone()).toBe(true);
+      expect(unexpectedRetry.isDone()).toBe(false);
     });
 
     it("should make exactly one POST attempt for media create (non-retryable to prevent duplicate attachments)", async () => {

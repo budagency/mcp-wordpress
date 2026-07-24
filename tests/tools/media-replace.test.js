@@ -25,11 +25,21 @@ vi.mock("fs", async (importOriginal) => {
   const actual = await importOriginal();
   return {
     ...actual,
+    // Async handle used by handleReplaceMedia's file read (controlled per-test).
     promises: {
       ...actual.promises,
       access: vi.fn(),
       open: vi.fn(),
     },
+    // Upstream 3.3.x hardened validateFilePath() to run real synchronous fs I/O
+    // (realpathSync/statSync/lstatSync) for symlink-safe containment, which runs
+    // before the mocked async read. This is a tool-contract unit test — path
+    // validation has its own coverage in tests/utils/validation.test.js — so stub
+    // those sync calls to treat the supplied path as an existing, contained
+    // regular file. (vi.clearAllMocks in beforeEach keeps these implementations.)
+    realpathSync: vi.fn((p) => p),
+    statSync: vi.fn(() => ({ isDirectory: () => true })),
+    lstatSync: vi.fn(() => ({ isSymbolicLink: () => false, isFile: () => true })),
   };
 });
 
