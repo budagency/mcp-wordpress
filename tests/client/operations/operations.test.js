@@ -5,12 +5,20 @@
  */
 
 import { describe, it, expect, vi, beforeEach } from "vitest";
+import { promises as fsPromises } from "fs";
 import { PostsOperations } from "../../../dist/client/operations/posts.js";
 import { PagesOperations } from "../../../dist/client/operations/pages.js";
 import { UsersOperations } from "../../../dist/client/operations/users.js";
 import { CommentsOperations } from "../../../dist/client/operations/comments.js";
 import { TaxonomiesOperations } from "../../../dist/client/operations/taxonomies.js";
 import { SiteOperations } from "../../../dist/client/operations/site.js";
+import { MediaOperations } from "../../../dist/client/operations/media.js";
+
+vi.mock("fs", () => ({
+  promises: {
+    open: vi.fn(),
+  },
+}));
 
 // Mock client factory
 const createMockClient = () => ({
@@ -359,6 +367,36 @@ describe("Operations Modules", () => {
         expect(mockClient.delete).toHaveBeenCalledWith("comments/1?force=false");
       });
     });
+
+    describe("approveComment", () => {
+      it("sends status: 'approve' (wp_set_comment_status()'s value, not 'approved')", async () => {
+        mockClient.put.mockResolvedValue({ id: 1, status: "approved" });
+
+        await commentsOps.approveComment(1);
+
+        expect(mockClient.put).toHaveBeenCalledWith("comments/1", { status: "approve" });
+      });
+    });
+
+    describe("rejectComment", () => {
+      it("sends status: 'hold' (wp_set_comment_status()'s value, not 'unapproved')", async () => {
+        mockClient.put.mockResolvedValue({ id: 1, status: "hold" });
+
+        await commentsOps.rejectComment(1);
+
+        expect(mockClient.put).toHaveBeenCalledWith("comments/1", { status: "hold" });
+      });
+    });
+
+    describe("spamComment", () => {
+      it("sends status: 'spam'", async () => {
+        mockClient.put.mockResolvedValue({ id: 1, status: "spam" });
+
+        await commentsOps.spamComment(1);
+
+        expect(mockClient.put).toHaveBeenCalledWith("comments/1", { status: "spam" });
+      });
+    });
   });
 
   describe("TaxonomiesOperations", () => {
@@ -647,6 +685,45 @@ describe("Operations Modules", () => {
 
         expect(mockClient.get).toHaveBeenCalledWith("");
         expect(result).toEqual(info);
+      });
+    });
+  });
+
+  describe("MediaOperations", () => {
+    let mockClient;
+    let mediaOps;
+
+    beforeEach(() => {
+      mockClient = createMockClient();
+      mediaOps = new MediaOperations(mockClient);
+      fsPromises.open.mockReset();
+    });
+
+    describe("uploadMedia", () => {
+      it("derives the upload filename from file_path's basename, not from title (regression: extension-less titles broke WordPress's filetype check)", async () => {
+        // Real JPEG magic bytes so validateMagicBytes() doesn't reject the fake content
+        const fileContent = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10]);
+        const mockFileHandle = {
+          stat: vi.fn().mockResolvedValue({ size: fileContent.length }),
+          readFile: vi.fn().mockResolvedValue(fileContent),
+          close: vi.fn().mockResolvedValue(undefined),
+        };
+        fsPromises.open.mockResolvedValue(mockFileHandle);
+        mockClient.post.mockResolvedValue({ id: 1 });
+
+        await mediaOps.uploadMedia({
+          file_path: "/tmp/photo.jpg",
+          title: "My Great Photo Without An Extension",
+        });
+
+        // Raw-binary transport: the body is the file Buffer and the filename rides in
+        // the Content-Disposition header — derived from the path basename ("photo.jpg"),
+        // never the extension-less title.
+        expect(mockClient.post).toHaveBeenCalledWith("media", expect.any(Buffer), expect.anything());
+        const [, body, options] = mockClient.post.mock.calls[0];
+        expect(Buffer.isBuffer(body)).toBe(true);
+        expect(options.headers["Content-Disposition"]).toBe('attachment; filename="photo.jpg"');
+        expect(mockFileHandle.close).toHaveBeenCalled();
       });
     });
   });

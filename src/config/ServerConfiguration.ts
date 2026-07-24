@@ -11,6 +11,7 @@ import { LoggerFactory } from "@/utils/logger.js";
 import { ConfigHelpers } from "./Config.js";
 import {
   ConfigurationValidator,
+  buildAuthConfig,
   type SiteType as SiteConfig,
   type MultiSiteConfigType as MultiSiteConfig,
   type McpConfigType,
@@ -35,27 +36,16 @@ export class ServerConfiguration {
     this.rootDir = path.resolve(__dirname, "../..");
     this.envPath = path.resolve(this.rootDir, ".env");
 
-    // Load environment variables (completely silent for MCP compatibility)
-    // Suppress dotenv output that could interfere with JSON-RPC communication
-    // eslint-disable-next-line no-console
-    const originalConsoleLog = console.log;
-    // eslint-disable-next-line no-console
-    const originalConsoleError = console.error;
-    try {
-      // eslint-disable-next-line no-console
-      console.log = () => {};
-      // eslint-disable-next-line no-console
-      console.error = () => {};
-      dotenv.config({
-        path: this.envPath,
-        debug: false,
-        override: false,
-      });
-    } finally {
-      // eslint-disable-next-line no-console
-      console.log = originalConsoleLog;
-      // eslint-disable-next-line no-console
-      console.error = originalConsoleError;
+    // Load environment variables silently. dotenv v17 logs an injection summary to
+    // console.log unless quiet:true is set, which would corrupt MCP stdio JSON-RPC.
+    const dotenvResult = dotenv.config({
+      path: this.envPath,
+      debug: false,
+      quiet: true,
+      override: false,
+    });
+    if (dotenvResult.error && ConfigHelpers.shouldDebug()) {
+      this.logger.debug("dotenv: .env file not loaded", { reason: dotenvResult.error.message });
     }
 
     // Debug output for DXT troubleshooting (reduced in DXT mode)
@@ -88,20 +78,43 @@ export class ServerConfiguration {
   }> {
     const configPath = path.resolve(this.rootDir, "mcp-wordpress.config.json");
 
-    try {
-      await fsPromises.access(configPath);
-      if (ConfigHelpers.shouldLogInfo()) {
-        this.logger.info("Found multi-site configuration file", { configPath });
-      }
-      return await this.loadMultiSiteConfig(configPath);
-    } catch (_error) {
-      // Config file doesn't exist or is not accessible
+    const configFileExists = await this.multiSiteConfigFileExists(configPath);
+    if (!configFileExists) {
       if (ConfigHelpers.shouldLogInfo()) {
         this.logger.info("Multi-site config not found, using environment variables for single-site mode", {
           configPath,
         });
       }
       return this.loadSingleSiteFromEnv(mcpConfig);
+    }
+
+    if (ConfigHelpers.shouldLogInfo()) {
+      this.logger.info("Found multi-site configuration file", { configPath });
+    }
+    // Any failure from here (JSON parse, schema validation, duplicate site
+    // IDs, client construction) must stop startup rather than silently
+    // falling back to single-site env config — loadMultiSiteConfig() already
+    // logs a fatal diagnostic and rethrows.
+    return await this.loadMultiSiteConfig(configPath);
+  }
+
+  /**
+   * Returns false only when the multi-site config file is absent (ENOENT).
+   * Any other access error (permission denied, etc.) is fatal: it is logged
+   * and rethrown so startup fails loudly instead of silently degrading to
+   * single-site mode with the wrong site's credentials.
+   */
+  private async multiSiteConfigFileExists(configPath: string): Promise<boolean> {
+    try {
+      await fsPromises.access(configPath);
+      return true;
+    } catch (_error) {
+      if ((_error as NodeJS.ErrnoException).code === "ENOENT") {
+        return false;
+      }
+      const message = `Failed to access multi-site configuration file: ${getErrorMessage(_error)}`;
+      this.logger.fatal(message, { configPath });
+      throw new Error(message);
     }
   }
 
@@ -125,11 +138,7 @@ export class ServerConfiguration {
       for (const site of config.sites) {
         const clientConfig: WordPressClientConfig = {
           baseUrl: site.config.WORDPRESS_SITE_URL,
-          auth: {
-            method: site.config.WORDPRESS_AUTH_METHOD || "app-password",
-            username: site.config.WORDPRESS_USERNAME,
-            appPassword: site.config.WORDPRESS_APP_PASSWORD,
-          },
+          auth: buildAuthConfig(site.config),
         };
 
         // Use cached client for better performance
@@ -229,11 +238,17 @@ export class ServerConfiguration {
       // Validate MCP config if provided
       const validatedMcpConfig = mcpConfig ? ConfigurationValidator.validateMcpConfig(mcpConfig) : undefined;
 
-      // Prepare environment configuration for validation
+      // Prepare environment configuration for validation. Every credential
+      // field for every supported auth method is forwarded here (not just
+      // app-password's) so basic/jwt/api-key configurations set via .env or
+      // MCP config actually reach the schema and, from there, the client.
       const envConfig = {
         WORDPRESS_SITE_URL: validatedMcpConfig?.wordpressSiteUrl || process.env.WORDPRESS_SITE_URL,
         WORDPRESS_USERNAME: validatedMcpConfig?.wordpressUsername || process.env.WORDPRESS_USERNAME,
         WORDPRESS_APP_PASSWORD: validatedMcpConfig?.wordpressAppPassword || process.env.WORDPRESS_APP_PASSWORD,
+        WORDPRESS_PASSWORD: validatedMcpConfig?.wordpressPassword || process.env.WORDPRESS_PASSWORD,
+        WORDPRESS_JWT_SECRET: validatedMcpConfig?.wordpressJwtSecret || process.env.WORDPRESS_JWT_SECRET,
+        WORDPRESS_API_KEY: validatedMcpConfig?.wordpressApiKey || process.env.WORDPRESS_API_KEY,
         WORDPRESS_AUTH_METHOD:
           validatedMcpConfig?.wordpressAuthMethod || process.env.WORDPRESS_AUTH_METHOD || "app-password",
         NODE_ENV: process.env.NODE_ENV,
@@ -256,11 +271,7 @@ export class ServerConfiguration {
 
       const clientConfig: WordPressClientConfig = {
         baseUrl: validatedConfig.WORDPRESS_SITE_URL,
-        auth: {
-          method: validatedConfig.WORDPRESS_AUTH_METHOD,
-          username: validatedConfig.WORDPRESS_USERNAME,
-          appPassword: validatedConfig.WORDPRESS_APP_PASSWORD,
-        },
+        auth: buildAuthConfig(validatedConfig),
       };
 
       // Use cached client for better performance
@@ -274,12 +285,7 @@ export class ServerConfiguration {
       const siteConfig: SiteConfig = {
         id: "default",
         name: "Default Site",
-        config: {
-          WORDPRESS_SITE_URL: validatedConfig.WORDPRESS_SITE_URL,
-          WORDPRESS_USERNAME: validatedConfig.WORDPRESS_USERNAME,
-          WORDPRESS_APP_PASSWORD: validatedConfig.WORDPRESS_APP_PASSWORD,
-          WORDPRESS_AUTH_METHOD: validatedConfig.WORDPRESS_AUTH_METHOD,
-        },
+        config: validatedConfig,
       };
 
       if (!isDXTMode) {

@@ -1,3 +1,6 @@
+import * as fs from "fs";
+import * as os from "os";
+import * as path from "path";
 import {
   validateId,
   validateString,
@@ -14,6 +17,7 @@ import {
   validatePaginationParams,
   validatePostParams,
 } from "@/utils/validation.js";
+import { isDisallowedHostname, isPrivateUrlAllowed, isInsecureHttpAllowed } from "@/utils/validation/network.js";
 import { WordPressAPIError } from "@/types/client.js";
 
 describe("validation utilities", () => {
@@ -74,19 +78,103 @@ describe("validation utilities", () => {
   });
 
   describe("validateFilePath", () => {
-    it("should validate safe file paths", () => {
-      expect(validateFilePath("file.txt", "/uploads")).toBe("/uploads/file.txt");
-      expect(validateFilePath("folder/file.txt", "/uploads")).toBe("/uploads/folder/file.txt");
+    let tmpRoot;
+
+    beforeEach(() => {
+      tmpRoot = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "mcp-wp-upload-test-")));
     });
 
-    it("should reject dangerous paths", () => {
-      expect(() => validateFilePath("../../../etc/passwd", "/uploads")).toThrow(WordPressAPIError);
-      // Note: some paths may be normalized and not throw
+    afterEach(() => {
+      fs.rmSync(tmpRoot, { recursive: true, force: true });
     });
 
-    it("should handle edge cases", () => {
-      // Empty paths and spaces are normalized by path.normalize
-      expect(() => validateFilePath("file with spaces.txt", "/uploads")).not.toThrow();
+    it("disables uploads when no base directory is configured", () => {
+      expect(() => validateFilePath("file.txt", undefined)).toThrow(WordPressAPIError);
+      expect(() => validateFilePath("file.txt", "")).toThrow(WordPressAPIError);
+    });
+
+    it("rejects a missing configured root", () => {
+      expect(() => validateFilePath("file.txt", path.join(tmpRoot, "does-not-exist"))).toThrow(WordPressAPIError);
+    });
+
+    it("validates a real file within the allowed directory", () => {
+      const filePath = path.join(tmpRoot, "file.txt");
+      fs.writeFileSync(filePath, "hello");
+      expect(validateFilePath("file.txt", tmpRoot)).toBe(fs.realpathSync(filePath));
+    });
+
+    it("validates a nested real file within the allowed directory", () => {
+      const nestedDir = path.join(tmpRoot, "folder");
+      fs.mkdirSync(nestedDir);
+      const filePath = path.join(nestedDir, "file.txt");
+      fs.writeFileSync(filePath, "hello");
+      expect(validateFilePath("folder/file.txt", tmpRoot)).toBe(fs.realpathSync(filePath));
+    });
+
+    it("rejects .. traversal outside the allowed directory", () => {
+      const outsideDir = fs.mkdtempSync(path.join(os.tmpdir(), "mcp-wp-outside-"));
+      fs.writeFileSync(path.join(outsideDir, "secret.txt"), "secret");
+      try {
+        expect(() => validateFilePath(`../${path.basename(outsideDir)}/secret.txt`, tmpRoot)).toThrow(
+          WordPressAPIError,
+        );
+      } finally {
+        fs.rmSync(outsideDir, { recursive: true, force: true });
+      }
+    });
+
+    it("rejects an absolute path outside the allowed directory", () => {
+      const outsideFile = path.join(os.tmpdir(), `mcp-wp-abs-outside-${process.pid}.txt`);
+      fs.writeFileSync(outsideFile, "secret");
+      try {
+        expect(() => validateFilePath(outsideFile, tmpRoot)).toThrow(WordPressAPIError);
+      } finally {
+        fs.rmSync(outsideFile, { force: true });
+      }
+    });
+
+    it("rejects a sibling directory that merely shares a name prefix", () => {
+      // Regression test: an allowed root of "/safe" must not match "/safe-secret"
+      // via a raw string startsWith() comparison.
+      const prefixCollisionDir = `${tmpRoot}-collision`;
+      fs.mkdirSync(prefixCollisionDir, { recursive: true });
+      const collisionFile = path.join(prefixCollisionDir, "file.txt");
+      fs.writeFileSync(collisionFile, "secret");
+      try {
+        expect(() => validateFilePath(collisionFile, tmpRoot)).toThrow(WordPressAPIError);
+      } finally {
+        fs.rmSync(prefixCollisionDir, { recursive: true, force: true });
+      }
+    });
+
+    it("rejects a symlink even when it points inside the allowed directory", () => {
+      const realFile = path.join(tmpRoot, "real.txt");
+      fs.writeFileSync(realFile, "hello");
+      const symlinkPath = path.join(tmpRoot, "link.txt");
+      fs.symlinkSync(realFile, symlinkPath);
+      expect(() => validateFilePath("link.txt", tmpRoot)).toThrow(WordPressAPIError);
+    });
+
+    it("rejects a symlink that escapes the allowed directory", () => {
+      const outsideDir = fs.mkdtempSync(path.join(os.tmpdir(), "mcp-wp-outside-"));
+      const outsideFile = path.join(outsideDir, "secret.txt");
+      fs.writeFileSync(outsideFile, "secret");
+      const symlinkPath = path.join(tmpRoot, "escape.txt");
+      fs.symlinkSync(outsideFile, symlinkPath);
+      try {
+        expect(() => validateFilePath("escape.txt", tmpRoot)).toThrow(WordPressAPIError);
+      } finally {
+        fs.rmSync(outsideDir, { recursive: true, force: true });
+      }
+    });
+
+    it("rejects a directory passed as the file path", () => {
+      fs.mkdirSync(path.join(tmpRoot, "folder"));
+      expect(() => validateFilePath("folder", tmpRoot)).toThrow(WordPressAPIError);
+    });
+
+    it("rejects a path that resolves to a non-existent file", () => {
+      expect(() => validateFilePath("does-not-exist.txt", tmpRoot)).toThrow(WordPressAPIError);
     });
   });
 
@@ -107,10 +195,26 @@ describe("validation utilities", () => {
   });
 
   describe("validateUrl", () => {
+    const originalAllowInsecureHttp = process.env.ALLOW_INSECURE_HTTP;
+    const originalAllowPrivateUrls = process.env.ALLOW_PRIVATE_URLS;
+
+    afterEach(() => {
+      if (originalAllowInsecureHttp === undefined) {
+        delete process.env.ALLOW_INSECURE_HTTP;
+      } else {
+        process.env.ALLOW_INSECURE_HTTP = originalAllowInsecureHttp;
+      }
+      if (originalAllowPrivateUrls === undefined) {
+        delete process.env.ALLOW_PRIVATE_URLS;
+      } else {
+        process.env.ALLOW_PRIVATE_URLS = originalAllowPrivateUrls;
+      }
+    });
+
     it("should validate correct URLs", () => {
       expect(validateUrl("https://example.com")).toBe("https://example.com");
-      expect(validateUrl("http://test.example.com")).toBe("http://test.example.com");
       expect(validateUrl("https://example.com/path")).toBe("https://example.com/path");
+      expect(validateUrl("https://test.example.com")).toBe("https://test.example.com");
     });
 
     it("should reject invalid URLs", () => {
@@ -122,6 +226,132 @@ describe("validation utilities", () => {
 
     it("should include field name in error messages", () => {
       expect(() => validateUrl("invalid", "siteUrl")).toThrow(/Invalid siteUrl.*must start with http/);
+    });
+
+    it("should reject http URLs by default", () => {
+      delete process.env.ALLOW_INSECURE_HTTP;
+      expect(() => validateUrl("http://test.example.com")).toThrow(/HTTP is not allowed/);
+    });
+
+    it("should accept http URLs when ALLOW_INSECURE_HTTP=true", () => {
+      process.env.ALLOW_INSECURE_HTTP = "true";
+      expect(validateUrl("http://test.example.com")).toBe("http://test.example.com");
+    });
+
+    it("should reject private/localhost hostnames by default", () => {
+      delete process.env.ALLOW_PRIVATE_URLS;
+      process.env.ALLOW_INSECURE_HTTP = "true";
+      expect(() => validateUrl("http://localhost:8080")).toThrow(/private\/localhost/i);
+      expect(() => validateUrl("https://169.254.169.254")).toThrow(/private\/localhost/i);
+    });
+
+    it("should accept private/localhost hostnames when ALLOW_PRIVATE_URLS=true", () => {
+      process.env.ALLOW_PRIVATE_URLS = "true";
+      process.env.ALLOW_INSECURE_HTTP = "true";
+      expect(validateUrl("http://localhost:8080")).toBe("http://localhost:8080");
+    });
+  });
+
+  describe("isDisallowedHostname", () => {
+    it("blocks localhost and loopback addresses", () => {
+      expect(isDisallowedHostname("localhost")).toBe(true);
+      expect(isDisallowedHostname("127.0.0.1")).toBe(true);
+      expect(isDisallowedHostname("127.0.0.2")).toBe(true);
+      expect(isDisallowedHostname("::1")).toBe(true);
+    });
+
+    it("blocks private IPv4 ranges", () => {
+      expect(isDisallowedHostname("10.0.0.1")).toBe(true);
+      expect(isDisallowedHostname("172.16.0.1")).toBe(true);
+      expect(isDisallowedHostname("172.31.255.255")).toBe(true);
+      expect(isDisallowedHostname("192.168.1.1")).toBe(true);
+    });
+
+    it("blocks link-local and unspecified IPv4 addresses, including cloud metadata", () => {
+      expect(isDisallowedHostname("169.254.169.254")).toBe(true);
+      expect(isDisallowedHostname("0.0.0.0")).toBe(true);
+    });
+
+    it("blocks IPv6 link-local and unique-local ranges", () => {
+      expect(isDisallowedHostname("fe80::1")).toBe(true);
+      expect(isDisallowedHostname("fc00::1")).toBe(true);
+      expect(isDisallowedHostname("fd12:3456:789a::1")).toBe(true);
+    });
+
+    it("blocks IPv4-mapped IPv6 addresses that resolve to a private range (dotted-decimal form)", () => {
+      expect(isDisallowedHostname("::ffff:169.254.169.254")).toBe(true);
+      expect(isDisallowedHostname("::ffff:127.0.0.1")).toBe(true);
+    });
+
+    it("blocks IPv4-mapped IPv6 addresses in the hex form new URL() actually produces", () => {
+      // new URL("https://[::ffff:169.254.169.254]/").hostname === "[::ffff:a9fe:a9fe]" —
+      // WHATWG URL canonicalizes IPv4-mapped literals to hex, so a dotted-decimal-only
+      // check here would silently never match real request traffic.
+      expect(isDisallowedHostname("[::ffff:a9fe:a9fe]")).toBe(true);
+      expect(isDisallowedHostname("::ffff:a9fe:a9fe")).toBe(true);
+      expect(isDisallowedHostname("[::ffff:7f00:1]")).toBe(true); // 127.0.0.1
+      // Full (uncompressed) hextet form, e.g. as an operator might type it directly
+      expect(isDisallowedHostname("0:0:0:0:0:ffff:169.254.169.254")).toBe(true);
+      expect(isDisallowedHostname("0:0:0:0:0:ffff:a9fe:a9fe")).toBe(true);
+    });
+
+    it("blocks additional reserved IPv4 ranges (CGN, IETF protocol, benchmarking)", () => {
+      expect(isDisallowedHostname("100.64.0.1")).toBe(true);
+      expect(isDisallowedHostname("100.127.255.255")).toBe(true);
+      expect(isDisallowedHostname("192.0.0.1")).toBe(true);
+      expect(isDisallowedHostname("198.18.0.1")).toBe(true);
+      expect(isDisallowedHostname("198.19.255.255")).toBe(true);
+      // Adjacent public ranges must not be swept in by mistake
+      expect(isDisallowedHostname("100.63.255.255")).toBe(false);
+      expect(isDisallowedHostname("100.128.0.0")).toBe(false);
+      expect(isDisallowedHostname("192.0.1.1")).toBe(false);
+      expect(isDisallowedHostname("198.20.0.1")).toBe(false);
+    });
+
+    it("blocks known cloud metadata hostnames", () => {
+      expect(isDisallowedHostname("metadata.google.internal")).toBe(true);
+      expect(isDisallowedHostname("metadata.goog")).toBe(true);
+    });
+
+    it("allows normal public hostnames and addresses, including public IPv4-mapped IPv6", () => {
+      expect(isDisallowedHostname("example.com")).toBe(false);
+      expect(isDisallowedHostname("wordpress.example.org")).toBe(false);
+      expect(isDisallowedHostname("8.8.8.8")).toBe(false);
+      expect(isDisallowedHostname("2001:4860:4860::8888")).toBe(false);
+      expect(isDisallowedHostname("::ffff:8.8.8.8")).toBe(false);
+      expect(isDisallowedHostname("[::ffff:808:808]")).toBe(false); // hex form of 8.8.8.8
+    });
+  });
+
+  describe("isPrivateUrlAllowed / isInsecureHttpAllowed", () => {
+    const originalAllowPrivateUrls = process.env.ALLOW_PRIVATE_URLS;
+    const originalAllowInsecureHttp = process.env.ALLOW_INSECURE_HTTP;
+
+    afterEach(() => {
+      if (originalAllowPrivateUrls === undefined) {
+        delete process.env.ALLOW_PRIVATE_URLS;
+      } else {
+        process.env.ALLOW_PRIVATE_URLS = originalAllowPrivateUrls;
+      }
+      if (originalAllowInsecureHttp === undefined) {
+        delete process.env.ALLOW_INSECURE_HTTP;
+      } else {
+        process.env.ALLOW_INSECURE_HTTP = originalAllowInsecureHttp;
+      }
+    });
+
+    it("default to false", () => {
+      delete process.env.ALLOW_PRIVATE_URLS;
+      delete process.env.ALLOW_INSECURE_HTTP;
+      expect(isPrivateUrlAllowed()).toBe(false);
+      expect(isInsecureHttpAllowed()).toBe(false);
+    });
+
+    it("respect the escape hatch env vars", () => {
+      process.env.ALLOW_PRIVATE_URLS = "true";
+      process.env.ALLOW_INSECURE_HTTP = "true";
+      expect(isPrivateUrlAllowed()).toBe(true);
+      expect(isInsecureHttpAllowed()).toBe(true);
     });
   });
 

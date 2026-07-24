@@ -62,9 +62,12 @@ export class MediaOperations {
 
     try {
       const stats = await fileHandle.stat();
-      // Always derive the upload filename from the file path. Using data.title
-      // here (Bud fix) produced wrong filenames/extensions when a human-readable
-      // title was set; the title is still applied as media metadata below.
+      // Always derive the upload filename from the file path, never from
+      // `data.title` (Bud fix). A human-readable title commonly has no file
+      // extension, so using it as the filename produced wrong extensions and
+      // tripped WordPress's filetype check ("Sorry, you are not allowed to
+      // upload this file type."). The title is still applied as media metadata
+      // via the follow-up update below.
       const filename = path.basename(data.file_path);
 
       // Check if file is too large (WordPress default is 2MB for most installs)
@@ -106,6 +109,9 @@ export class MediaOperations {
     // Content-Type leaked through — WordPress rejected it as "Invalid JSON body
     // passed". Send the raw binary with a Content-Disposition header (the WP REST
     // media endpoint accepts this), then apply any metadata via a follow-up update.
+    // (Upstream 3.3.x fixes the same root cause with native FormData+Blob; we keep
+    // the raw-binary transport because our custom replaceMedia() reuses it against
+    // the Bud Media Replace plugin route — see replaceMedia below.)
     const uploadTimeout = options?.timeout !== undefined ? options.timeout : 600000; // 10 minutes default
     // Non-idempotent create — single attempt to avoid duplicate attachments on
     // a post-processing network error (a Buffer body would otherwise be retried;

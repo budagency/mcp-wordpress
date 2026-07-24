@@ -6,9 +6,9 @@
  * domain-specific operations extracted into separate modules under ./operations/
  */
 
-// Use native fetch in Node.js 18+
-import FormData from "form-data";
+// Use native fetch and FormData in Node.js 18+ (both are globals, no import needed)
 import { getUserAgent } from "@/utils/version.js";
+import { isDisallowedHostname, isInsecureHttpAllowed, isPrivateUrlAllowed } from "@/utils/validation/network.js";
 import type {
   IWordPressClient,
   WordPressClientConfig,
@@ -17,6 +17,7 @@ import type {
   HTTPMethod,
   RequestOptions,
   ClientStats,
+  RawResponse,
 } from "@/types/client.js";
 import { WordPressAPIError, AuthenticationError, RateLimitError } from "@/types/client.js";
 import { config } from "@/config/Config.js";
@@ -246,6 +247,17 @@ export class WordPressClient implements IWordPressClient {
     return this.authenticated;
   }
 
+  /**
+   * Replace this client's authentication configuration for the current
+   * session. Does not itself verify the new credentials — call
+   * authenticate() afterward to confirm they work.
+   */
+  setAuthConfig(auth: AuthConfig): void {
+    this.auth = auth;
+    this.authenticated = false;
+    this.jwtToken = null;
+  }
+
   get stats(): ClientStats {
     return { ...this._stats };
   }
@@ -270,20 +282,18 @@ export class WordPressClient implements IWordPressClient {
         throw new Error("Only HTTP and HTTPS protocols are allowed");
       }
 
+      // Require HTTPS unless explicitly allowed (WordPress auth headers travel over this URL)
+      // Set ALLOW_INSECURE_HTTP=true for local development over plain HTTP
+      if (parsed.protocol === "http:" && !isInsecureHttpAllowed()) {
+        throw new Error(
+          "HTTP is not allowed, use HTTPS. Set ALLOW_INSECURE_HTTP=true to override for local development.",
+        );
+      }
+
       // Prevent localhost/private IP access unless explicitly allowed
       // Set ALLOW_PRIVATE_URLS=true for local development with a local WordPress
-      if (process.env.ALLOW_PRIVATE_URLS !== "true") {
-        const hostname = parsed.hostname.toLowerCase();
-        if (
-          hostname === "localhost" ||
-          hostname === "127.0.0.1" ||
-          hostname === "::1" ||
-          hostname.match(/^10\./) ||
-          hostname.match(/^172\.(1[6-9]|2[0-9]|3[01])\./) ||
-          hostname.match(/^192\.168\./)
-        ) {
-          throw new Error("Private/localhost URLs not allowed. Set ALLOW_PRIVATE_URLS=true for local development.");
-        }
+      if (isDisallowedHostname(parsed.hostname) && !isPrivateUrlAllowed()) {
+        throw new Error("Private/localhost URLs not allowed. Set ALLOW_PRIVATE_URLS=true for local development.");
       }
 
       // Return clean URL without query parameters or fragments
@@ -548,6 +558,39 @@ export class WordPressClient implements IWordPressClient {
     data: unknown = null,
     options: RequestOptions = {},
   ): Promise<T> {
+    const raw = await this.requestRaw<T>(method, endpoint, data, options);
+    return raw.data;
+  }
+
+  /**
+   * Same as request(), but also returns the real HTTP status and response
+   * headers WordPress sent back — used by the cache layer to preserve
+   * genuine server-provided validators (ETag, Last-Modified, Cache-Control)
+   * instead of synthesizing its own.
+   */
+  async requestWithMetadata<T = unknown>(
+    method: HTTPMethod,
+    endpoint: string,
+    data: unknown = null,
+    options: RequestOptions = {},
+  ): Promise<RawResponse<T>> {
+    return this.requestRaw<T>(method, endpoint, data, options);
+  }
+
+  private headersToRecord(headers: Headers): Record<string, string> {
+    const record: Record<string, string> = {};
+    headers.forEach((value, key) => {
+      record[key] = value;
+    });
+    return record;
+  }
+
+  private async requestRaw<T = unknown>(
+    method: HTTPMethod,
+    endpoint: string,
+    data: unknown = null,
+    options: RequestOptions = {},
+  ): Promise<RawResponse<T>> {
     const timer = startTimer();
     this._stats.totalRequests++;
 
@@ -555,7 +598,13 @@ export class WordPressClient implements IWordPressClient {
     // Validate absolute URLs through the same SSRF guard as the site URL
     const url = endpoint.startsWith("http") ? this.validateAndSanitizeUrl(endpoint) : `${this.apiUrl}/${cleanEndpoint}`;
 
-    const { headers: customHeaders, retries: retryOverride, params: _unusedParams, ...restOptions } = options;
+    const {
+      headers: customHeaders,
+      retries: retryOverride,
+      params: _unusedParams,
+      idempotent,
+      ...restOptions
+    } = options;
     const baseHeaders: Record<string, string> = {
       "Content-Type": "application/json",
       "User-Agent": getUserAgent(),
@@ -567,8 +616,14 @@ export class WordPressClient implements IWordPressClient {
     const requestTimeout = options.timeout || this.timeout;
     const configuredRetries =
       typeof retryOverride === "number" && retryOverride > 0 ? retryOverride : this.maxRetries || 1;
+    // GET is safe/idempotent by nature and always eligible for retry. Every
+    // mutating method (POST/PUT/PATCH/DELETE) is retried only when the caller
+    // explicitly marks the specific operation idempotent — retrying a POST
+    // after an ambiguous network failure (e.g. a connection reset after the
+    // server already processed it) can otherwise create a duplicate resource.
+    const canRetryMethod = method === "GET" || idempotent === true;
     const canRetryBody = this.isRetryableBody(data);
-    const maxAttempts = canRetryBody ? configuredRetries : 1;
+    const maxAttempts = canRetryMethod && canRetryBody ? configuredRetries : 1;
 
     let lastError: Error = new Error("Unknown error");
 
@@ -594,6 +649,17 @@ export class WordPressClient implements IWordPressClient {
         log.debug(`API Request: ${method} ${url}${attempt > 0 ? ` (attempt ${attempt + 1})` : ""}`);
 
         const response = await fetch(url, fetchOptions);
+
+        // 304 Not Modified is a valid outcome of a conditional GET (caller
+        // sent If-None-Match/If-Modified-Since), not an error — the cache
+        // layer needs to see it to know its stale entry is still current.
+        if (response.status === 304) {
+          clearTimeout(timeoutId);
+          this._stats.successfulRequests++;
+          const duration = timer.end();
+          this.updateAverageResponseTime(duration);
+          return { data: null as T, status: 304, headers: this.headersToRecord(response.headers) };
+        }
 
         if (!response.ok) {
           const fallbackResult = await this.handleErrorResponseWithFallback<T>(
@@ -651,12 +717,11 @@ export class WordPressClient implements IWordPressClient {
       data instanceof FormData ||
       (typeof data === "object" && data && "append" in data && typeof (data as FormData).append === "function")
     ) {
-      if (typeof (data as { getHeaders?: () => Record<string, string> }).getHeaders === "function") {
-        const formHeaders = (data as unknown as { getHeaders(): Record<string, string> }).getHeaders();
-        Object.assign(headers, formHeaders);
-      } else {
-        delete headers["Content-Type"];
-      }
+      // Native FormData needs no explicit Content-Type: fetch computes the
+      // correct multipart boundary and sets the header itself once given a
+      // FormData body. Drop whatever default we set earlier so it can't
+      // collide with fetch's own header.
+      delete headers["Content-Type"];
       fetchOptions.body = data as FormData;
       return;
     }
@@ -709,6 +774,9 @@ export class WordPressClient implements IWordPressClient {
     }
 
     if (data instanceof FormData) {
+      // Never retry FormData uploads: retrying a mutating upload risks
+      // creating a duplicate media item if the first attempt actually
+      // succeeded server-side but the client never saw the response.
       return false;
     }
 
@@ -729,7 +797,7 @@ export class WordPressClient implements IWordPressClient {
     requestTimeout: number,
     fetchOptions: RequestInit & { headers: Record<string, string> },
     timer: ReturnType<typeof startTimer>,
-  ): Promise<T | undefined> {
+  ): Promise<RawResponse<T> | undefined> {
     const errorText = new TextDecoder("utf-8").decode(await response.arrayBuffer());
     let errorMessage: string;
 
@@ -780,7 +848,7 @@ export class WordPressClient implements IWordPressClient {
     requestTimeout: number,
     fetchOptions: RequestInit & { headers: Record<string, string> },
     timer: ReturnType<typeof startTimer>,
-  ): Promise<T | undefined> {
+  ): Promise<RawResponse<T> | undefined> {
     log.debug(`404 on pretty permalinks, trying index.php approach`);
 
     try {
@@ -812,38 +880,41 @@ export class WordPressClient implements IWordPressClient {
         return undefined;
       }
 
+      const meta = { status: fallbackResponse.status, headers: this.headersToRecord(fallbackResponse.headers) };
       const responseText = new TextDecoder("utf-8").decode(await fallbackResponse.arrayBuffer());
       if (!responseText) {
         this._stats.successfulRequests++;
         const duration = timer.end();
         this.updateAverageResponseTime(duration);
-        return null as T;
+        return { data: null as T, ...meta };
       }
 
       const result = JSON.parse(responseText);
       this._stats.successfulRequests++;
       const duration = timer.end();
       this.updateAverageResponseTime(duration);
-      return result as T;
+      return { data: result as T, ...meta };
     } catch (fallbackError) {
       log.debug(`Fallback request failed: ${(fallbackError as Error).message}`);
       return undefined;
     }
   }
 
-  // Note: Returns null cast as T for empty responses. Callers should handle
-  // potential null values when the WordPress API returns empty bodies (e.g. DELETE).
+  // Note: Returns data: null cast as T for empty responses. Callers should
+  // handle potential null values when the WordPress API returns empty
+  // bodies (e.g. DELETE).
   private async parseResponse<T>(
     response: Response,
     endpoint: string,
     timer: ReturnType<typeof startTimer>,
-  ): Promise<T> {
+  ): Promise<RawResponse<T>> {
+    const meta = { status: response.status, headers: this.headersToRecord(response.headers) };
     const responseText = new TextDecoder("utf-8").decode(await response.arrayBuffer());
     if (!responseText) {
       this._stats.successfulRequests++;
       const duration = timer.end();
       this.updateAverageResponseTime(duration);
-      return null as T;
+      return { data: null as T, ...meta };
     }
 
     try {
@@ -851,7 +922,7 @@ export class WordPressClient implements IWordPressClient {
       this._stats.successfulRequests++;
       const duration = timer.end();
       this.updateAverageResponseTime(duration);
-      return result as T;
+      return { data: result as T, ...meta };
     } catch (parseError) {
       if (endpoint.includes("users/me") || endpoint.includes("jwt-auth")) {
         throw new WordPressAPIError(`Invalid JSON response: ${(parseError as Error).message}`);
@@ -859,7 +930,7 @@ export class WordPressClient implements IWordPressClient {
       this._stats.successfulRequests++;
       const duration = timer.end();
       this.updateAverageResponseTime(duration);
-      return responseText as T;
+      return { data: responseText as T, ...meta };
     }
   }
 

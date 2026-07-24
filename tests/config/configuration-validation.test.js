@@ -120,27 +120,83 @@ describe("Configuration Validation Tests", () => {
       expect(() => ConfigurationValidator.validateMultiSiteConfig(invalidConfig)).toThrow();
     });
 
-    it("should validate all supported authentication methods", () => {
-      const authMethods = ["app-password", "jwt", "basic", "api-key", "cookie"];
+    it("should validate each supported auth method when given its own required credentials", () => {
+      const siteConfigsByMethod = {
+        "app-password": {
+          WORDPRESS_SITE_URL: "https://example.com",
+          WORDPRESS_AUTH_METHOD: "app-password",
+          WORDPRESS_USERNAME: "testuser",
+          WORDPRESS_APP_PASSWORD: "password123",
+        },
+        basic: {
+          WORDPRESS_SITE_URL: "https://example.com",
+          WORDPRESS_AUTH_METHOD: "basic",
+          WORDPRESS_USERNAME: "testuser",
+          WORDPRESS_PASSWORD: "password123",
+        },
+        jwt: {
+          WORDPRESS_SITE_URL: "https://example.com",
+          WORDPRESS_AUTH_METHOD: "jwt",
+          WORDPRESS_USERNAME: "testuser",
+          WORDPRESS_PASSWORD: "password123",
+          WORDPRESS_JWT_SECRET: "jwt-secret-value",
+        },
+        "api-key": {
+          WORDPRESS_SITE_URL: "https://example.com",
+          WORDPRESS_AUTH_METHOD: "api-key",
+          WORDPRESS_API_KEY: "api-key-value",
+        },
+      };
 
-      authMethods.forEach((method) => {
-        const config = {
-          sites: [
-            {
-              id: "site1",
-              name: "Test Site",
-              config: {
-                WORDPRESS_SITE_URL: "https://example.com",
-                WORDPRESS_USERNAME: "testuser",
-                WORDPRESS_APP_PASSWORD: "password",
-                WORDPRESS_AUTH_METHOD: method,
-              },
-            },
-          ],
-        };
-
+      Object.values(siteConfigsByMethod).forEach((siteConfig) => {
+        const config = { sites: [{ id: "site1", name: "Test Site", config: siteConfig }] };
         expect(() => ConfigurationValidator.validateMultiSiteConfig(config)).not.toThrow();
       });
+    });
+
+    it("should reject cookie as a configurable auth method", () => {
+      const config = {
+        sites: [
+          {
+            id: "site1",
+            name: "Test Site",
+            config: {
+              WORDPRESS_SITE_URL: "https://example.com",
+              WORDPRESS_USERNAME: "testuser",
+              WORDPRESS_APP_PASSWORD: "password123",
+              WORDPRESS_AUTH_METHOD: "cookie",
+            },
+          },
+        ],
+      };
+
+      // Not offered through config validation — a WordPress session nonce
+      // can't be obtained through this schema/setup flow.
+      expect(() => ConfigurationValidator.validateMultiSiteConfig(config)).toThrow();
+    });
+
+    it("should reject a method selection missing that method's required credentials", () => {
+      // Regression test: previously any method validated successfully as
+      // long as WORDPRESS_USERNAME + WORDPRESS_APP_PASSWORD were present,
+      // even when the selected method (jwt here) needs different fields —
+      // so a JWT config missing its secret was silently accepted.
+      const config = {
+        sites: [
+          {
+            id: "site1",
+            name: "Test Site",
+            config: {
+              WORDPRESS_SITE_URL: "https://example.com",
+              WORDPRESS_USERNAME: "testuser",
+              WORDPRESS_APP_PASSWORD: "password123",
+              WORDPRESS_AUTH_METHOD: "jwt",
+              // Missing WORDPRESS_JWT_SECRET and WORDPRESS_PASSWORD
+            },
+          },
+        ],
+      };
+
+      expect(() => ConfigurationValidator.validateMultiSiteConfig(config)).toThrow();
     });
 
     it("should use default auth method when not specified", () => {
@@ -275,6 +331,54 @@ describe("Configuration Validation Tests", () => {
 
       expect(() => ConfigurationValidator.validateEnvironmentConfig(env)).toThrow();
     });
+
+    it("should validate basic, jwt, and api-key env configs given their own credentials", () => {
+      const basicEnv = {
+        WORDPRESS_SITE_URL: "https://example.com",
+        WORDPRESS_AUTH_METHOD: "basic",
+        WORDPRESS_USERNAME: "testuser",
+        WORDPRESS_PASSWORD: "password123",
+      };
+      const jwtEnv = {
+        WORDPRESS_SITE_URL: "https://example.com",
+        WORDPRESS_AUTH_METHOD: "jwt",
+        WORDPRESS_USERNAME: "testuser",
+        WORDPRESS_PASSWORD: "password123",
+        WORDPRESS_JWT_SECRET: "jwt-secret-value",
+      };
+      const apiKeyEnv = {
+        WORDPRESS_SITE_URL: "https://example.com",
+        WORDPRESS_AUTH_METHOD: "api-key",
+        WORDPRESS_API_KEY: "api-key-value",
+      };
+
+      expect(() => ConfigurationValidator.validateEnvironmentConfig(basicEnv)).not.toThrow();
+      expect(() => ConfigurationValidator.validateEnvironmentConfig(jwtEnv)).not.toThrow();
+      expect(() => ConfigurationValidator.validateEnvironmentConfig(apiKeyEnv)).not.toThrow();
+    });
+
+    it("should reject an env config selecting jwt without its required secret", () => {
+      const env = {
+        WORDPRESS_SITE_URL: "https://example.com",
+        WORDPRESS_AUTH_METHOD: "jwt",
+        WORDPRESS_USERNAME: "testuser",
+        WORDPRESS_PASSWORD: "password123",
+        // Missing WORDPRESS_JWT_SECRET
+      };
+
+      expect(() => ConfigurationValidator.validateEnvironmentConfig(env)).toThrow();
+    });
+
+    it("should reject cookie as a configurable auth method", () => {
+      const env = {
+        WORDPRESS_SITE_URL: "https://example.com",
+        WORDPRESS_AUTH_METHOD: "cookie",
+        WORDPRESS_USERNAME: "testuser",
+        WORDPRESS_APP_PASSWORD: "password123",
+      };
+
+      expect(() => ConfigurationValidator.validateEnvironmentConfig(env)).toThrow();
+    });
   });
 
   describe("MCP Configuration Validation", () => {
@@ -360,22 +464,81 @@ describe("Configuration Validation Tests", () => {
       expect(() => ConfigurationValidator.validateMultiSiteConfig(config)).not.toThrow();
     });
 
-    it("should accept http URLs", () => {
-      const config = {
+    describe("HTTPS / private-host escape hatches", () => {
+      let originalHttp;
+      let originalPrivate;
+
+      beforeEach(() => {
+        originalHttp = process.env.ALLOW_INSECURE_HTTP;
+        originalPrivate = process.env.ALLOW_PRIVATE_URLS;
+        // Every test in this block starts from a known baseline (both unset) so it
+        // can't pass or fail based on the developer's/CI's ambient environment.
+        delete process.env.ALLOW_INSECURE_HTTP;
+        delete process.env.ALLOW_PRIVATE_URLS;
+      });
+
+      afterEach(() => {
+        if (originalHttp === undefined) {
+          delete process.env.ALLOW_INSECURE_HTTP;
+        } else {
+          process.env.ALLOW_INSECURE_HTTP = originalHttp;
+        }
+        if (originalPrivate === undefined) {
+          delete process.env.ALLOW_PRIVATE_URLS;
+        } else {
+          process.env.ALLOW_PRIVATE_URLS = originalPrivate;
+        }
+      });
+
+      const configFor = (url) => ({
         sites: [
           {
             id: "site1",
             name: "Test Site",
             config: {
-              WORDPRESS_SITE_URL: "http://localhost:8080",
+              WORDPRESS_SITE_URL: url,
               WORDPRESS_USERNAME: "testuser",
               WORDPRESS_APP_PASSWORD: "password",
             },
           },
         ],
-      };
+      });
 
-      expect(() => ConfigurationValidator.validateMultiSiteConfig(config)).not.toThrow();
+      it("should reject http URLs by default", () => {
+        expect(() => ConfigurationValidator.validateMultiSiteConfig(configFor("http://example.com"))).toThrow(
+          /HTTP is not allowed/,
+        );
+      });
+
+      it("should accept http URLs when ALLOW_INSECURE_HTTP=true", () => {
+        process.env.ALLOW_INSECURE_HTTP = "true";
+        expect(() => ConfigurationValidator.validateMultiSiteConfig(configFor("http://example.com"))).not.toThrow();
+      });
+
+      it("should reject private/localhost URLs by default, even with ALLOW_INSECURE_HTTP=true", () => {
+        process.env.ALLOW_INSECURE_HTTP = "true";
+        expect(() => ConfigurationValidator.validateMultiSiteConfig(configFor("http://localhost:8080"))).toThrow(
+          /Private\/localhost/,
+        );
+      });
+
+      it("should accept private/localhost URLs when both escape hatches are set", () => {
+        process.env.ALLOW_INSECURE_HTTP = "true";
+        process.env.ALLOW_PRIVATE_URLS = "true";
+        expect(() => ConfigurationValidator.validateMultiSiteConfig(configFor("http://localhost:8080"))).not.toThrow();
+      });
+
+      it("should accept https private/localhost URLs when only ALLOW_PRIVATE_URLS is set", () => {
+        process.env.ALLOW_PRIVATE_URLS = "true";
+        expect(() => ConfigurationValidator.validateMultiSiteConfig(configFor("https://localhost:8443"))).not.toThrow();
+      });
+
+      it("should reject known cloud metadata hostnames even with ALLOW_INSECURE_HTTP=true", () => {
+        process.env.ALLOW_INSECURE_HTTP = "true";
+        expect(() => ConfigurationValidator.validateMultiSiteConfig(configFor("http://169.254.169.254"))).toThrow(
+          /Private\/localhost/,
+        );
+      });
     });
 
     it("should reject other protocols", () => {

@@ -5,6 +5,57 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.3.19](https://github.com/docdyhr/mcp-wordpress/compare/v3.3.18...v3.3.19) (2026-07-21)
+
+### 🐛 Bug Fixes
+
+* **security:** SSRF denylist, HTTPS enforcement, logger redaction, dep floors ([#205](https://github.com/docdyhr/mcp-wordpress/issues/205)) ([b899959](https://github.com/docdyhr/mcp-wordpress/commit/b8999592d7ac12bd30aa1cf8352abd381c6c0f06))
+
+### 📚 Documentation
+
+* install DOX hierarchical AGENTS.md tree ([#204](https://github.com/docdyhr/mcp-wordpress/issues/204)) ([9a5b580](https://github.com/docdyhr/mcp-wordpress/commit/9a5b5809cd547b54365b4474a3b0b751cbc05cd1))
+
+## [3.3.18](https://github.com/docdyhr/mcp-wordpress/compare/v3.3.17...v3.3.18) (2026-07-19)
+
+### 🐛 Bug Fixes
+
+* remediate 2026-07-19 security/correctness/release audit (14 items) ([#203](https://github.com/docdyhr/mcp-wordpress/issues/203)) ([f6c29e6](https://github.com/docdyhr/mcp-wordpress/commit/f6c29e624dd83a38694b1d9daf68aca01c1f1d1d))
+
+## [3.3.17](https://github.com/docdyhr/mcp-wordpress/compare/v3.3.16...v3.3.17) (2026-07-09)
+
+### 🐛 Bug Fixes
+
+* **auth:** bound wp_test_auth with 10s timeout and check ping() return value ([#202](https://github.com/docdyhr/mcp-wordpress/issues/202)) ([7e2fdac](https://github.com/docdyhr/mcp-wordpress/commit/7e2fdac9d5a28a1d9cc96f497d52f22d5bccbbe9))
+
+## [3.3.16](https://github.com/docdyhr/mcp-wordpress/compare/v3.3.15...v3.3.16) (2026-07-09)
+
+### 🐛 Bug Fixes
+
+* resolve media upload 400 error caused by duplicate Content-Type header ([#199](https://github.com/docdyhr/mcp-wordpress/issues/199)) ([0df639b](https://github.com/docdyhr/mcp-wordpress/commit/0df639bcec6eaf1060a2e43dc5c325e20177db19)), closes [#2](https://github.com/docdyhr/mcp-wordpress/issues/2)
+
+### 📚 Documentation
+
+* trim README from 1168 to 342 lines ([#197](https://github.com/docdyhr/mcp-wordpress/issues/197)) ([3bdef35](https://github.com/docdyhr/mcp-wordpress/commit/3bdef35b24a5902855a771577806238fcf268dd3))
+
+## [Unreleased]
+
+### 🐛 Bug Fixes
+
+* **security:** expand private URL denylist and unify SSRF policy across `ConfigurationSchema` and `WordPressClient` — adds `169.254.0.0/16`, `0.0.0.0`, IPv6 link-local (`fe80::/10`)/unique-local (`fc00::/7`), and known cloud metadata hostnames; both enforcement points now share one `isDisallowedHostname` helper instead of drifting independently
+* **security:** require HTTPS for WordPress site URLs by default; `ALLOW_INSECURE_HTTP=true` remains available for local/Docker development over plain HTTP
+* **security:** deep-redact sensitive log context — object values under a sensitive key (e.g. `password`, `secret`) are now redacted instead of passed through as-is
+* **deps:** raise `axios` and `brace-expansion` npm override floors to `>=1.18.0` / `>=5.0.7`; apply non-breaking `npm audit fix` for `fast-uri`, `hono`, and `body-parser` transitive advisories
+
+### 📚 Documentation
+
+* Trim README from 1168 to 343 lines — remove duplicate sections and verbose examples, replace with links to existing docs
+
+## [3.3.15](https://github.com/docdyhr/mcp-wordpress/compare/v3.3.14...v3.3.15) (2026-06-22)
+
+### 🐛 Bug Fixes
+
+* resolve project review issues (README version drift, dead code, console patch) ([#196](https://github.com/docdyhr/mcp-wordpress/issues/196)) ([cd3827a](https://github.com/docdyhr/mcp-wordpress/commit/cd3827ab8ce5d7318d99067d605ff824c49054f6))
+
 ## [3.3.14](https://github.com/docdyhr/mcp-wordpress/compare/v3.3.13...v3.3.14) (2026-06-10)
 
 ### 🐛 Bug Fixes
