@@ -289,8 +289,11 @@ export class MediaTools {
 
     try {
       // Validate and sanitise the path (mirrors handleUploadMedia).
-      const allowedBasePath = process.env.MCP_UPLOAD_BASE_DIR || "/";
-      const safePath = validateFilePath(rawPath, allowedBasePath);
+      // No "/" fallback: an unset MCP_UPLOAD_BASE_DIR must DISABLE local reads,
+      // not silently widen them to the whole filesystem. validateFilePath throws
+      // UPLOADS_DISABLED on an empty base, which is the same fail-closed
+      // behaviour handleUploadMedia already has.
+      const safePath = validateFilePath(rawPath, process.env.MCP_UPLOAD_BASE_DIR);
 
       try {
         await fs.promises.access(safePath);

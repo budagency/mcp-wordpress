@@ -119,8 +119,16 @@ describe("MediaTools — wp_replace_media", () => {
   let mediaTools;
   let mockClient;
 
+  const savedUploadBase = process.env.MCP_UPLOAD_BASE_DIR;
+
   beforeEach(() => {
     vi.clearAllMocks();
+
+    // handleReplaceMedia fails closed when MCP_UPLOAD_BASE_DIR is unset (an
+    // unset base must disable local reads, not widen them to "/"). These are
+    // tool-contract tests, so give them a configured base; the fail-closed
+    // behaviour itself is asserted in its own case below.
+    process.env.MCP_UPLOAD_BASE_DIR = "/";
 
     mockClient = {
       // Existing media methods (used by other tools in the same class)
@@ -138,6 +146,15 @@ describe("MediaTools — wp_replace_media", () => {
     };
 
     mediaTools = new MediaTools();
+  });
+
+  afterAll(() => {
+    // Don't leak this into other suites in the same worker.
+    if (savedUploadBase === undefined) {
+      delete process.env.MCP_UPLOAD_BASE_DIR;
+    } else {
+      process.env.MCP_UPLOAD_BASE_DIR = savedUploadBase;
+    }
   });
 
   // -------------------------------------------------------------------------
@@ -276,6 +293,28 @@ describe("MediaTools — wp_replace_media", () => {
   // -------------------------------------------------------------------------
 
   describe("handleReplaceMedia — errors", () => {
+    // Regression guard. This path previously read
+    //   process.env.MCP_UPLOAD_BASE_DIR || "/"
+    // so an unset base silently allowed ANY absolute path on the box
+    // (/etc/shadow, ~/.ssh keys, ~/.claude/secrets.env) to be read and pushed
+    // into a client media library. handleUploadMedia always failed closed here;
+    // this one did not. Deleting the fallback is what makes them agree.
+    it("fails closed when MCP_UPLOAD_BASE_DIR is unset, rather than allowing /", async () => {
+      delete process.env.MCP_UPLOAD_BASE_DIR;
+      fsPromises.access.mockResolvedValueOnce(undefined);
+      fsPromises.open.mockResolvedValueOnce(mockFileHandle(makePngBuffer()));
+
+      await expect(
+        mediaTools.handleReplaceMedia(mockClient, {
+          id: 1,
+          file_path: "/etc/shadow",
+        }),
+      ).rejects.toThrow(/disabled/i);
+
+      // and nothing was sent to the site
+      expect(mockClient.replaceMedia).not.toHaveBeenCalled();
+    });
+
     it("throws when the file is not found", async () => {
       fsPromises.access.mockRejectedValueOnce(new Error("ENOENT: no such file"));
 
