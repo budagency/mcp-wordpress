@@ -1,6 +1,6 @@
 {
   "name": "mcp-wordpress",
-  "version": "3.3.19",
+  "version": "3.3.34",
   "description": "Comprehensive Model Context Protocol server for WordPress management with composition-based architecture, 71 tools, SEO toolkit, performance monitoring, intelligent caching, and production-ready authentication",
   "keywords": [
     "mcp",
@@ -35,14 +35,15 @@
     "LICENSE"
   ],
   "scripts": {
-    "build": "tsc && tsc-alias",
+    "build": "node -e \"require('fs').rmSync('dist', { recursive: true, force: true })\" && tsc && tsc-alias",
     "build:watch": "tsc --watch",
     "check:ci": "npm run typecheck && npm run lint && npm run test:coverage",
     "check:ignore": "node scripts/sync-ignore-files.js",
     "dev": "npm run build && DEBUG=true node dist/index.js",
     "docker:build": "docker build -t docdyhr/mcp-wordpress:latest .",
     "docker:publish": "./scripts/manual-docker-publish.sh",
-    "docs:generate": "npm run build && node scripts/generate-docs.js",
+    "docs:format": "prettier --write \"docs/api/**/*.md\" && markdownlint --fix \"docs/api/**/*.md\"",
+    "docs:generate": "npm run build && node scripts/generate-docs.js && npm run docs:format",
     "docs:serve": "npm run docs:generate && node scripts/serve-docs.js",
     "docs:validate": "npm run docs:generate && node scripts/validate-docs.js",
     "docs:watch": "npm run docs:generate && echo 'Watching for changes...' && npm run docs:serve",
@@ -53,24 +54,25 @@
     "eval": "npm run build && npx mcp-eval evaluations/config/wordpress-tools-eval.yaml dist/index.js",
     "eval:report": "node evaluations/scripts/generate-report.js",
     "fix:rest-auth": "bash scripts/fix-rest-api-auth.sh",
-    "format": "prettier --write *.md docs/**/*.md src/**/*.ts tests/**/*.ts",
-    "format:check": "prettier --check *.md docs/**/*.md src/**/*.ts tests/**/*.ts",
+    "format": "prettier --write \"*.md\" \"docs/**/*.md\" \"src/**/*.ts\" \"tests/**/*.ts\"",
+    "format:check": "prettier --check \"*.md\" \"docs/**/*.md\" \"src/**/*.ts\" \"tests/**/*.ts\"",
     "health": "node scripts/health-check.js",
     "lint": "eslint src/ tests/",
     "lint:fix": "eslint src/ tests/ --fix",
-    "lint:md": "markdownlint *.md docs/**/*.md",
-    "lint:md:fix": "markdownlint *.md docs/**/*.md --fix",
+    "lint:md": "markdownlint \"*.md\" \"docs/**/*.md\"",
+    "lint:md:fix": "markdownlint \"*.md\" \"docs/**/*.md\" --fix",
     "pre-commit": "lint-staged",
     "prepare": "husky",
     "prepublishOnly": "npm run build && npm run check:ignore",
     "release": "semantic-release",
     "release:dry": "semantic-release --dry-run",
     "security:audit": "npm audit --production",
+    "security:demo": "npm run build && node scripts/security-demo.js",
     "security:fix": "npm audit fix",
     "security:full": "npm run security:scan && npm run security:review && npm run security:monitor && npm run test:security",
-    "security:monitor": "npm audit --audit-level=moderate || echo 'Security monitoring completed'",
-    "security:review": "npm run test:security || echo 'Security review completed'",
-    "security:scan": "npm run build && node scripts/security-demo.js || npm audit --audit-level=low",
+    "security:monitor": "npm run security:scan",
+    "security:review": "npm run test:security",
+    "security:scan": "node scripts/security-audit-gate.js",
     "setup": "node bin/setup.js",
     "setup:vscode": "code --install-extension bradlc.vscode-tailwindcss && code --install-extension continue.continue && code --install-extension ms-python.python && code --install-extension ms-vscode.hexeditor",
     "start": "npm run build && node dist/index.js",
@@ -81,7 +83,7 @@
     "test:batch:1": "npm run build && NODE_OPTIONS=\"--max-old-space-size=8192\" vitest run tests/security/ tests/cache/ tests/server/ --no-coverage --reporter=default",
     "test:batch:2": "npm run build && NODE_OPTIONS=\"--max-old-space-size=8192\" vitest run tests/client/ tests/config/ tests/utils/ --no-coverage --reporter=default",
     "test:batch:3": "npm run build && NODE_OPTIONS=\"--max-old-space-size=8192\" vitest run tests/tools/ tests/performance/ --no-coverage --reporter=default",
-    "test:batch:4": "npm run build && NODE_OPTIONS=\"--max-old-space-size=8192\" vitest run tests/*.test.js tests/docs/ --no-coverage --reporter=default",
+    "test:batch:4": "npm run build && NODE_OPTIONS=\"--max-old-space-size=8192\" vitest run tests/*.test.js tests/docs/ tests/bin/ --no-coverage --reporter=default",
     "test:cache": "npm run build && vitest run tests/cache/",
     "test:ci": "npm run build && CI=true NODE_OPTIONS=\"--max-old-space-size=8192\" vitest run --reporter=default",
     "test:ci:safe": "NODE_OPTIONS=\"--max-old-space-size=8192\" npx vitest run --config vitest.ci.config.ts",
@@ -112,14 +114,15 @@
       "prettier --write"
     ],
     "*.md": [
-      "markdownlint --fix"
+      "markdownlint --fix",
+      "prettier --write"
     ],
     "package.json": [
       "sort-package-json"
     ]
   },
   "overrides": {
-    "@hono/node-server": "^1.19.13",
+    "@hono/node-server": "^2.0.12",
     "@pact-foundation/pact-node": {
       "@types/request": {
         "form-data": "^4.0.3"
@@ -128,18 +131,20 @@
     "axios": ">=1.18.0",
     "brace-expansion": ">=5.0.7",
     "express-rate-limit": ">=8.5.1",
-    "fast-uri": ">=3.1.2",
+    "fast-uri": ">=4.1.4 <5.0.0",
     "flatted": ">=3.4.2",
     "follow-redirects": ">=1.15.12",
-    "hono": ">=4.12.21",
+    "hono": ">=4.12.34",
+    "ip-address": ">=10.3.1",
     "js-yaml": ">=4.2.0 <5.0.0",
     "markdown-it": ">=14.2.0 <15.0.0",
     "minimatch": "10.2.3",
     "path-to-regexp": ">=8.4.0",
     "postcss": ">=8.5.10",
-    "qs": ">=6.15.2",
+    "qs": ">=6.16.0 <7.0.0",
     "tar": ">=7.5.16",
     "underscore": "1.13.8",
+    "undici": ">=6.28.0",
     "vite": ">=7.3.2"
   },
   "dependencies": {

@@ -20,37 +20,49 @@ jobs:
   dependency-review:
     name: 🔍 Dependency Security Review
     runs-on: ubuntu-latest
-    # Skip for automated dependency update PRs
-    if: |
-      !(
-        contains(github.event.pull_request.labels.*.name, 'dependencies') ||
-        contains(github.event.pull_request.title, 'dependabot') ||
-        contains(github.event.pull_request.title, 'dependency update') ||
-        github.actor == 'dependabot[bot]' ||
-        github.actor == 'github-actions[bot]'
-      )
+    # Runs on every PR, including Dependabot's own — it previously skipped those (and any PR
+    # labeled "dependencies"), the exact gap a security review flagged. continue-on-error below
+    # already protects against this failing a Dependabot PR outright when GitHub Advanced
+    # Security isn't available; there's no reason to also skip it entirely.
     steps:
       - name: 📥 Checkout Code
         uses: actions/checkout@v6
 
       - name: 🔍 Dependency Review
         uses: actions/dependency-review-action@v4
-        continue-on-error: true # Don't fail if GitHub Advanced Security not enabled
+        # Runtime HIGH+ findings now block merge (item 6 of the security audit
+        # remediation plan). Previously continue-on-error: true meant this step
+        # could never fail a PR even when GitHub Advanced Security was enabled
+        # and found a real vulnerability — fail-on-severity/fail-on-scopes
+        # below were configured but toothless.
+        #
+        # Correction: the assumption that this action exits successfully when
+        # GitHub Advanced Security/Dependency graph is unavailable was wrong —
+        # confirmed via this repo's own PR #217 CI run, it hard-fails with
+        # "Dependency review is not supported on this repository", and that
+        # error had been happening silently on every PR before continue-on-error
+        # was removed here (verified against prior runs' raw logs). That's a
+        # repo-configuration gap (see the linked settings URL), not something
+        # this workflow file can fix — flagged separately to the repo owner.
         with:
           # Make less strict for dependency updates
           fail-on-severity: high # Changed from 'moderate' to 'high'
           # Fail if vulnerabilities are found in runtime dependencies
           fail-on-scopes: runtime
-          # License check (allow common open source licenses)
-          allow-licenses: MIT, Apache-2.0, BSD-2-Clause, BSD-3-Clause, ISC, CC0-1.0, Unlicense, LGPL-2.1, LGPL-3.0
           # Security advisories configuration
           allow-ghsas: false
           # Comment on PR with results (only on failure for dependency PRs)
           comment-summary-in-pr: on-failure # Changed from 'always'
           # Vulnerability severity threshold
           vulnerability-check: true
-          # License compliance check (relaxed for dependency updates)
-          license-check: true # Keep enabled but make non-blocking
+          # License compliance is handled by the separate, intentionally
+          # non-blocking license-compliance job below — keeping it off here too
+          # avoids a second, blocking license gate that PR review caught: with
+          # continue-on-error removed, an unlisted-but-legitimate open-source
+          # license (e.g. MPL-2.0) would fail this step just like a real
+          # vulnerability finding would, contrary to item 6's intent (runtime
+          # HIGH+ vulnerabilities blocking, not license policy).
+          license-check: false
           # Show OpenSSF Scorecard information
           show-openssf-scorecard: true # Keep enabled for supply chain visibility
 
@@ -74,32 +86,19 @@ jobs:
 
       - name: 🔍 NPM Security Audit
         run: |
-          echo "## 🔍 NPM Security Audit Results" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
+          npm audit --omit=dev --json > audit-results.json 2>/dev/null || true
 
-          # Run audit and capture results
-          if npm audit --audit-level=moderate --json > audit-results.json 2>/dev/null; then
-            echo "✅ **No moderate or higher vulnerabilities found**" >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "⚠️ **Vulnerabilities detected**" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "## 🔍 NPM Security Audit Results"
+            echo ""
+            echo "- 🔴 Critical: $(jq -r '.metadata.vulnerabilities.critical // 0' audit-results.json)"
+            echo "- 🟠 High: $(jq -r '.metadata.vulnerabilities.high // 0' audit-results.json)"
+            echo "- 🟡 Moderate: $(jq -r '.metadata.vulnerabilities.moderate // 0' audit-results.json)"
+            echo "- 🟢 Low: $(jq -r '.metadata.vulnerabilities.low // 0' audit-results.json)"
+          } >> "$GITHUB_STEP_SUMMARY"
 
-            # Parse and display results
-            if [ -f audit-results.json ]; then
-              CRITICAL=$(cat audit-results.json | jq -r '.metadata.vulnerabilities.critical // 0')
-              HIGH=$(cat audit-results.json | jq -r '.metadata.vulnerabilities.high // 0')
-              MODERATE=$(cat audit-results.json | jq -r '.metadata.vulnerabilities.moderate // 0')
-              LOW=$(cat audit-results.json | jq -r '.metadata.vulnerabilities.low // 0')
-
-              {
-                echo "- 🔴 Critical: $CRITICAL"
-                echo "- 🟠 High: $HIGH"
-                echo "- 🟡 Moderate: $MODERATE"
-                echo "- 🟢 Low: $LOW"
-                echo ""
-                echo "**Action Required:** Please run \`npm audit fix\` to address vulnerabilities."
-              } >> "$GITHUB_STEP_SUMMARY"
-            fi
-          fi
+      - name: 🎯 Production Dependency Audit Gate
+        run: node scripts/security-audit-gate.js
 
       - name: 📊 Upload Security Audit Results
         if: always()

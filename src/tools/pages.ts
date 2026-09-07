@@ -1,7 +1,9 @@
 import { WordPressClient } from "@/client/api.js";
+import { WordPressAPIError } from "@/types/client.js";
 import type { MCPToolSchema } from "@/types/mcp.js";
 import { CreatePageRequest, PostQueryParams as PageQueryParams, UpdatePageRequest } from "@/types/wordpress.js";
-import { getErrorMessage } from "@/utils/error.js";
+import { isPermissionError, preserveToolError } from "@/utils/error.js";
+import { isUnsafeWordPressContent } from "@/security/InputValidator.js";
 import { parseId, parseIdAndForce, toolParams } from "./params.js";
 
 /**
@@ -58,7 +60,8 @@ export class PageTools {
             },
             include_content: {
               type: "boolean",
-              description: "If true, includes the full HTML content of the page. Default: false",
+              description:
+                "If true, includes the full page content as raw source (context=edit), preserving Gutenberg block markup for editing. Default: false",
             },
             raw: {
               type: "boolean",
@@ -173,7 +176,7 @@ export class PageTools {
         pages.map((p) => `- ID ${p.id}: **${p.title.rendered}** (${p.status})\n  Link: ${p.link}`).join("\n");
       return content;
     } catch (_error) {
-      throw new Error(`Failed to list pages: ${getErrorMessage(_error)}`);
+      preserveToolError("Failed to list pages", _error);
     }
   }
 
@@ -181,8 +184,22 @@ export class PageTools {
     const id = parseId(params);
     const { include_content = false, raw = false } = params as { include_content?: boolean; raw?: boolean };
     try {
-      const context = raw ? "edit" : "view";
-      const page = await client.getPage(id, context);
+      // Both the explicit raw=true flag (Bud) and include_content (upstream #206)
+      // need context=edit to get content.raw — the Gutenberg block markup.
+      let page;
+      if (raw || include_content) {
+        try {
+          page = await client.getPage(id, "edit");
+        } catch (error) {
+          if (!isPermissionError(error)) {
+            throw error;
+          }
+          // Credentials lack edit capability for context=edit — fall back to rendered content
+          page = await client.getPage(id, "view");
+        }
+      } else {
+        page = await client.getPage(id, "view");
+      }
       let content =
         `**Page Details (ID: ${page.id})**\n\n` +
         `- **Title:** ${page.title.rendered}\n` +
@@ -199,34 +216,53 @@ export class PageTools {
         }
         content +=
           `\n\n**Content (raw — edit this):**\n${rawBody ?? "(not available — ensure context=edit is supported)"}` +
-          `\n\n**Content (rendered — for reference only):**\n${page.content.rendered || "(empty)"}`;
+          `\n\n**Content (rendered — for reference only):**\n${page.content?.rendered || "(empty)"}`;
       } else if (include_content) {
-        content += `\n\n**Content:**\n\n` + `${page.content.rendered || "(empty)"}`;
+        content += `\n\n**Content:**\n\n` + `${(page.content?.raw ?? page.content?.rendered) || "(empty)"}`;
       }
 
       return content;
     } catch (_error) {
-      throw new Error(`Failed to get page: ${getErrorMessage(_error)}`);
+      preserveToolError("Failed to get page", _error);
     }
   }
 
   public async handleCreatePage(client: WordPressClient, params: Record<string, unknown>): Promise<unknown> {
     const createParams = toolParams<CreatePageRequest>(params);
     try {
+      // Defense-in-depth: the Zod schema at the MCP tool boundary (ToolRegistry.ts) already
+      // rejects unmistakable XSS vectors in `content` via isUnsafeWordPressContent. Re-check
+      // here rather than running content through the allowlist-based sanitizeHtml(), which
+      // strips/escapes Gutenberg <!-- wp:* --> block markup and corrupts ordinary
+      // block-editor page content.
+      if (createParams.content !== undefined && isUnsafeWordPressContent(createParams.content)) {
+        throw new WordPressAPIError(
+          "Unsafe content (script tag, javascript: URL, or event handler)",
+          400,
+          "INVALID_PARAMETER",
+        );
+      }
       const page = await client.createPage(createParams);
       return `✅ Page created successfully!\n- ID: ${page.id}\n- Title: ${page.title.rendered}\n- Link: ${page.link}`;
     } catch (_error) {
-      throw new Error(`Failed to create page: ${getErrorMessage(_error)}`);
+      preserveToolError("Failed to create page", _error);
     }
   }
 
   public async handleUpdatePage(client: WordPressClient, params: Record<string, unknown>): Promise<unknown> {
     const updateParams = toolParams<UpdatePageRequest & { id: number }>(params);
     try {
+      if (updateParams.content !== undefined && isUnsafeWordPressContent(updateParams.content)) {
+        throw new WordPressAPIError(
+          "Unsafe content (script tag, javascript: URL, or event handler)",
+          400,
+          "INVALID_PARAMETER",
+        );
+      }
       const page = await client.updatePage(updateParams);
       return `✅ Page ${page.id} updated successfully.`;
     } catch (_error) {
-      throw new Error(`Failed to update page: ${getErrorMessage(_error)}`);
+      preserveToolError("Failed to update page", _error);
     }
   }
 
@@ -250,7 +286,7 @@ export class PageTools {
       // Some WordPress installations return empty/null responses on successful deletion
       return `✅ Page ${id} has been ${action}.`;
     } catch (_error) {
-      throw new Error(`Failed to delete page: ${getErrorMessage(_error)}`);
+      preserveToolError("Failed to delete page", _error);
     }
   }
 
@@ -268,7 +304,7 @@ export class PageTools {
           .join("\n");
       return content;
     } catch (_error) {
-      throw new Error(`Failed to get page revisions: ${getErrorMessage(_error)}`);
+      preserveToolError("Failed to get page revisions", _error);
     }
   }
 }

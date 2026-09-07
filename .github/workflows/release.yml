@@ -59,6 +59,18 @@ jobs:
         env:
           HUSKY: 0
 
+      - name: 🔍 TypeScript Check
+        run: npm run typecheck
+
+      - name: 🧹 Lint Code
+        run: npm run lint
+
+      - name: 🎨 Format Check
+        run: npm run format:check
+
+      - name: 🔒 Production Dependency Audit Gate
+        run: npm run security:scan
+
       - name: 🧪 Run Essential Tests
         run: npm run test:ci
         env:
@@ -91,15 +103,45 @@ jobs:
     runs-on: ubuntu-latest
     needs: semantic-release
     if: needs.semantic-release.outputs.new-release-published == 'true'
+    # Backstop against the default 6h job timeout: the v3.3.19 release run hung for 6h0m
+    # after the linux/arm64 QEMU emulation crashed mid-`npm ci` ("uncaught target signal 4
+    # (Illegal instruction) - core dumped") — docker/build-push-action never returned, so
+    # nothing here failed fast and the retry step below never got a chance to run.
+    timeout-minutes: 75
     permissions:
       contents: read
       packages: write
+    services:
+      # Local scan registry (item 4 of the security audit remediation plan): the
+      # multi-platform image is built and pushed here first, scanned in place, and
+      # only promoted to Docker Hub once that scan is clean. `driver-opts:
+      # network=host` on the buildx builder below lets it reach `localhost:5000`
+      # directly — Docker's registry client treats localhost as plain HTTP by
+      # default, so no insecure-registry configuration is needed.
+      registry:
+        image: registry:2
+        ports:
+          - 5000:5000
     steps:
       - name: 📥 Checkout Code
         uses: actions/checkout@v6
 
+      - name: 🐳 Set up QEMU (Multi-platform)
+        # Without this, linux/arm64 emulation falls back to whatever QEMU binfmt the
+        # runner image ships by default, which has crashed mid-`npm ci` with "qemu:
+        # uncaught target signal 4 (Illegal instruction) - core dumped" on v3.3.19 and
+        # again on v3.3.25 (both the primary attempt and its retry, identically) —
+        # docker-modern.yml already pins this step and has had zero arm64 crashes across
+        # its last 5 runs, which is why this is believed to be the actual fix rather than
+        # another layer of containment like the timeout/retry/verify steps below.
+        uses: docker/setup-qemu-action@v4
+
       - name: 🐳 Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
+        with:
+          # network=host gives the builder direct access to the registry service
+          # container on localhost:5000 (see the services block above).
+          driver-opts: network=host
 
       - name: 🔐 Log in to Docker Hub
         uses: docker/login-action@v4
@@ -145,7 +187,7 @@ jobs:
             type=raw,value=latest,enable={{is_default_branch}}
           labels: |
             org.opencontainers.image.title=MCP WordPress Server
-            org.opencontainers.image.description=Complete WordPress MCP Server with 59 management tools, intelligent caching, and real-time monitoring
+            org.opencontainers.image.description=Complete WordPress MCP Server with 71 management tools, intelligent caching, and real-time monitoring
             org.opencontainers.image.version=${{ needs.semantic-release.outputs.new-release-version || github.ref_name }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.created={{date 'YYYY-MM-DDTHH:mm:ssZ'}}
@@ -169,14 +211,22 @@ jobs:
           echo "Metadata JSON:"
           echo "${META_JSON}" | jq . 2>/dev/null || echo "${META_JSON}"
 
-      - name: 🏗️ Build and Push Docker Image
+      - name: 🏗️ Build and Push to Local Scan Registry
         id: docker-build
+        # Pushes to localhost:5000 (not Docker Hub yet — see the promote step
+        # below) so the actual multi-platform manifest that will ship can be
+        # scanned before anything public happens. Bounded well under the job's
+        # 75m timeout-minutes so a hung/crashed emulation layer (see job-level
+        # comment above) fails fast and leaves time for the retry step below,
+        # instead of consuming the run's entire time budget.
+        timeout-minutes: 30
+        continue-on-error: true
         uses: docker/build-push-action@v6
         with:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
+          tags: localhost:5000/mcp-wordpress:scan
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
@@ -188,14 +238,37 @@ jobs:
           provenance: true
           sbom: true
 
-      - name: 🔄 Retry Docker Build on Failure
-        if: failure() && steps.docker-build.outcome == 'failure'
+      - name: 🔄 Retry Build on Failure
+        # A timed-out docker-build doesn't reliably report one specific outcome: the
+        # v3.3.19 incident hit the job-level 6h ceiling, which marks in-progress steps
+        # 'cancelled'; the v3.3.20 incident hit THIS step's own timeout-minutes (added
+        # below) and reported 'failure' instead (confirmed via the Jobs API on that
+        # actual run). Checking only 'failure' would miss the first case; checking only
+        # 'cancelled' would miss the second — hence the explicit OR of both. Deliberately
+        # narrower than `!= 'success'`: that would also match 'skipped' (e.g. if Docker
+        # login fails earlier, docker-build never runs), which would attempt a build
+        # without its prerequisites and mask the real failure. continue-on-error above
+        # means this custom `if:` is evaluated regardless of docker-build's own outcome
+        # (its continue-on-error keeps the job's default success() check passing), and a
+        # step-level timeout below keeps a second hang from burning the rest of the job's
+        # budget.
+        #
+        # continue-on-error here too: on the v3.3.20 release both this step and the
+        # primary attempt above hit their 30m timeout (docker/build-push-action@v6's
+        # wrapper reliably hangs after its actual work finishes in this environment —
+        # not QEMU-crash-specific, since v3.3.20 hit it with no crash at all). Without
+        # continue-on-error, a genuine failure/timeout here would skip every step below
+        # (Trivy scan, promote, verify) and report the whole job failed even when nothing
+        # public was ever affected — this only ever writes to the local scan registry.
+        if: steps.docker-build.outcome == 'failure' || steps.docker-build.outcome == 'cancelled'
+        timeout-minutes: 30
+        continue-on-error: true
         uses: docker/build-push-action@v6
         with:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
+          tags: localhost:5000/mcp-wordpress:scan
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
@@ -205,6 +278,66 @@ jobs:
             VCS_REF=${{ github.sha }}
           provenance: true
           sbom: true
+
+      - name: 🔍 Trivy Vulnerability Scan (pre-publish gate, linux/amd64)
+        id: trivy-scan-amd64
+        # This is the actual multi-platform manifest that would ship, scanned while
+        # it only exists in the local, non-public registry service above — a
+        # genuine pre-publish gate rather than the informational post-push scan
+        # this replaced. No continue-on-error: a HIGH/CRITICAL finding here stops
+        # the job before the promote step below, so a vulnerable image never
+        # reaches Docker Hub. TRIVY_INSECURE is required because Trivy's own
+        # registry client (unlike the Docker daemon) does not automatically trust
+        # localhost as plain HTTP — without it every scan against the local
+        # registry service fails before it ever evaluates a vulnerability.
+        # TRIVY_PLATFORM selects one architecture from the multi-platform
+        # manifest; without it Trivy silently scans only the runner's native
+        # linux/amd64 image and the separately-built linux/arm64 layers would
+        # ship unexamined, so amd64 and arm64 are scanned as two explicit steps.
+        env:
+          TRIVY_INSECURE: "true"
+          TRIVY_PLATFORM: linux/amd64
+        uses: aquasecurity/trivy-action@0.35.0
+        with:
+          scan-type: "image"
+          image-ref: localhost:5000/mcp-wordpress:scan
+          format: "table"
+          severity: "HIGH,CRITICAL"
+          exit-code: "1"
+
+      - name: 🔍 Trivy Vulnerability Scan (pre-publish gate, linux/arm64)
+        id: trivy-scan-arm64
+        env:
+          TRIVY_INSECURE: "true"
+          TRIVY_PLATFORM: linux/arm64
+        uses: aquasecurity/trivy-action@0.35.0
+        with:
+          scan-type: "image"
+          image-ref: localhost:5000/mcp-wordpress:scan
+          format: "table"
+          severity: "HIGH,CRITICAL"
+          exit-code: "1"
+
+      - name: 🚀 Promote Scanned Image to Docker Hub
+        # Copies the exact manifest that was just scanned to the real Docker Hub
+        # tags via `docker buildx imagetools create` — a registry-to-registry copy,
+        # not a rebuild, so the published image is byte-identical to what Trivy
+        # just cleared. Only reached if both scans above succeeded.
+        env:
+          META_TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          set -euo pipefail
+          tag_args=()
+          while IFS= read -r tag; do
+            [ -n "$tag" ] && tag_args+=(-t "$tag")
+          done <<< "$META_TAGS"
+          if [ ${#tag_args[@]} -eq 0 ]; then
+            echo "::error::No tags extracted from metadata output (steps.meta.outputs.tags was empty) — refusing to promote with no destination tags."
+            exit 1
+          fi
+          echo "Promoting localhost:5000/mcp-wordpress:scan to:"
+          printf '  %s\n' "${tag_args[@]}"
+          docker buildx imagetools create "${tag_args[@]}" localhost:5000/mcp-wordpress:scan
 
       - name: 📝 Update Docker Hub Description
         uses: peter-evans/dockerhub-description@v5
@@ -249,6 +382,12 @@ jobs:
         run: |
           echo "::error title=Docker Publishing Verification Failed::Failed to verify Docker image publication"
           echo "Manual intervention may be required to publish the Docker image"
+
+      - name: 🚨 Trivy Scan Failed - Create Alert
+        if: failure() && (steps.trivy-scan-amd64.outcome == 'failure' || steps.trivy-scan-arm64.outcome == 'failure')
+        run: |
+          echo "::error title=Docker Image Vulnerability Scan Failed::Pre-publish scan found HIGH/CRITICAL vulnerabilities in localhost:5000/mcp-wordpress:scan — the image was NOT promoted to Docker Hub."
+          echo "Nothing public was affected. Fix the vulnerable dependency and release a new version."
 
   # 📦 DXT Package Build and Upload
   dxt-package:
