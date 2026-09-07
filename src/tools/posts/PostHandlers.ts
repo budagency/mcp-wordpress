@@ -8,7 +8,7 @@
 
 import { WordPressClient } from "@/client/api.js";
 import { CreatePostRequest, PostQueryParams, PostStatus, UpdatePostRequest, WordPressPost } from "@/types/wordpress.js";
-import { getErrorMessage } from "@/utils/error.js";
+import { getErrorMessage, isPermissionError } from "@/utils/error.js";
 import { ErrorHandlers } from "@/utils/enhancedError.js";
 import { validateId, validatePaginationParams, validatePostParams } from "@/utils/validation.js";
 import { sanitizeHtml } from "@/utils/validation/security.js";
@@ -205,8 +205,24 @@ export async function handleGetPost(
 ): Promise<WordPressPost | string> {
   try {
     const postId = validateId(params.id, "post ID");
-    const context = params.raw ? "edit" : "view";
-    const post = await client.getPost(postId, context);
+    // Only include full content if explicitly requested (for backward compatibility, default to true).
+    // When content is wanted — or the explicit raw=true flag is set — fetch with
+    // context=edit so content.raw (Gutenberg block markup) is available.
+    const includeContent = params.include_content !== false;
+    let post;
+    if (includeContent || params.raw) {
+      try {
+        post = await client.getPost(postId, "edit");
+      } catch (error) {
+        if (!isPermissionError(error)) {
+          throw error;
+        }
+        // Credentials lack edit capability for context=edit — fall back to rendered content
+        post = await client.getPost(postId, "view");
+      }
+    } else {
+      post = await client.getPost(postId, "view");
+    }
 
     // Get additional metadata for comprehensive response
     const [author, categories, tags] = await Promise.all([
@@ -242,7 +258,7 @@ export async function handleGetPost(
       minute: "2-digit",
     });
 
-    const content = post.content?.rendered || "";
+    const content = post.content?.raw ?? post.content?.rendered ?? "";
     const excerpt = post.excerpt?.rendered ? sanitizeHtml(post.excerpt.rendered).trim() : "";
     const wordCount = sanitizeHtml(content).split(/\s+/).filter(Boolean).length;
 
@@ -269,7 +285,9 @@ export async function handleGetPost(
       response += `\n## Excerpt\n${excerpt}\n`;
     }
 
-    // When raw=true: return both raw (editable source) and rendered (expanded HTML)
+    // When raw=true: return both raw (editable source) and rendered (expanded HTML).
+    // `content` now prefers content.raw (upstream #206), so the reference line must
+    // read post.content.rendered directly or it would echo the raw markup twice.
     if (params.raw) {
       const rawContent = post.content?.raw;
       const rawTitle = post.title?.raw;
@@ -277,13 +295,9 @@ export async function handleGetPost(
         response += `\n## Title (raw)\n${rawTitle}\n`;
       }
       response += `\n## Content (raw — edit this)\n${rawContent ?? "(not available — ensure context=edit is supported)"}\n`;
-      response += `\n## Content (rendered — for reference only)\n${content}\n`;
-    } else {
-      // Only include full content if explicitly requested (for backward compatibility, default to true)
-      const includeContent = params.include_content !== false;
-      if (content && includeContent) {
-        response += `\n## Content\n${content}\n`;
-      }
+      response += `\n## Content (rendered — for reference only)\n${post.content?.rendered ?? ""}\n`;
+    } else if (content && includeContent) {
+      response += `\n## Content\n${content}\n`;
     }
 
     // Add management links and metadata
@@ -311,8 +325,13 @@ export async function handleCreatePost(
   params: CreatePostRequest,
 ): Promise<WordPressPost | string> {
   try {
-    validatePostParams(params);
-    const post = await client.createPost(params);
+    // validatePostParams sanitizes `content` (and validates title/status/categories/tags/
+    // featured_media/date) via the allowlist-based sanitizeHtml() — its returned, sanitized
+    // fields must actually be sent, not just the original `params`, or the sanitization has no
+    // effect at all (a real gap a security review caught: this used to be called only for its
+    // throwing side effect, then discarded).
+    const validated = validatePostParams(params);
+    const post = await client.createPost({ ...params, ...validated } as CreatePostRequest);
 
     // Build success response with management links
     let response = `✅ **Post Created Successfully**\n\n`;
@@ -350,9 +369,10 @@ export async function handleUpdatePost(
     const postId = validateId(params.id, "post ID");
 
     const { id: _id, ...updateData } = params;
-    validatePostParams(updateData, true);
+    // See handleCreatePost: validated (sanitized) fields must be sent, not just updateData.
+    const validated = validatePostParams(updateData, true);
 
-    const updatedPost = await client.updatePost({ id: postId, ...updateData });
+    const updatedPost = await client.updatePost({ id: postId, ...updateData, ...validated });
 
     // Build change summary
     let response = `✅ **Post Updated Successfully**\n\n`;

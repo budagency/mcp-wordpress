@@ -3,6 +3,7 @@
  */
 import { LoggerFactory } from "./logger.js";
 import { config } from "@/config/Config.js";
+import { WordPressAPIError } from "@/types/client.js";
 
 const logger = LoggerFactory.server().child({ component: "ErrorUtils" });
 
@@ -21,6 +22,24 @@ function legacyConsoleError(...args: unknown[]) {
 // Test hook: exported only for instrumentation in unit tests (tree-shakeable)
 // @__PURE__ This constant has no side effects and can be dropped in production builds
 export const __errorUtilsLogger = logger;
+
+/**
+ * True when an error represents a WordPress REST permission denial (401/403),
+ * e.g. requesting context=edit with credentials that lack edit capability.
+ */
+export function isPermissionError(error: unknown): boolean {
+  if (error && typeof error === "object") {
+    const statusCode = (error as { statusCode?: unknown }).statusCode;
+    if (statusCode === 401 || statusCode === 403) {
+      return true;
+    }
+    const code = (error as { code?: unknown }).code;
+    if (code === "rest_forbidden" || code === "rest_forbidden_context") {
+      return true;
+    }
+  }
+  return /\b(401|403|rest_forbidden)\b/.test(getErrorMessage(error));
+}
 
 export function getErrorMessage(error: unknown): string {
   if (error instanceof Error) {
@@ -92,6 +111,22 @@ export function handleToolError(error: unknown, operation: string, context?: Rec
   }
 
   throw new Error(`Failed to ${operation}: ${message}`);
+}
+
+/**
+ * Rethrows a caught client error with an operation-specific message prefix (e.g. "Failed to
+ * list media"), preserving statusCode/code/data/subclass-identity for WordPressAPIError (and
+ * its subclasses AuthenticationError/RateLimitError/ValidationError) instead of flattening it
+ * into a plain Error — ToolRegistry's auth-error detection and other callers depend on that
+ * metadata surviving to the MCP tool boundary. Falls back to a plain Error only for inputs
+ * that carry no such metadata to begin with.
+ */
+export function preserveToolError(prefix: string, error: unknown): never {
+  if (error instanceof WordPressAPIError) {
+    error.message = `${prefix}: ${error.message}`;
+    throw error;
+  }
+  throw new Error(`${prefix}: ${getErrorMessage(error)}`);
 }
 
 /**

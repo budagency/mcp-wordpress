@@ -1,31 +1,30 @@
 # mcp-wordpress
 
-MCP (Model Context Protocol) Server for WordPress. TypeScript ESM, 71 WordPress tools across 12 categories, exposed
-over the MCP SDK to any MCP-compatible client.
+MCP (Model Context Protocol) Server for WordPress. TypeScript ESM, 71 WordPress tools across 12 categories, exposed over
+the MCP SDK to any MCP-compatible client.
 
 ## Quick Start
 
 ```bash
-npm run build              # tsc && tsc-alias — required before most test/CLI scripts (tests run against dist/)
+npm run build               # cross-platform clean + tsc && tsc-alias — required before most test/CLI scripts (tests run against dist/)
 npm test                   # Run tests (npm run test:batch)
 npm run dev                # Build + run with DEBUG=true
 npm run health              # System check (scripts/health-check.js)
 npm run fix:rest-auth      # Fix WordPress 401 errors (scripts/fix-rest-api-auth.sh)
 npm run lint                # eslint src/ tests/
 npm run typecheck           # tsc --noEmit
-npm run security:scan       # build + scripts/security-demo.js, falls back to npm audit
+npm run security:scan       # blocking production npm-audit gate (scripts/security-audit-gate.js) against security-exceptions.json
+npm run security:demo       # AI security-scanner demo (scripts/security-demo.js) — informational only, not a gate
 ```
 
 ## Architecture
 
-**Core**: MCP Server (`src/index.ts`) registers 71 WordPress tools via `src/server/ToolRegistry.ts`.
-**Client**: `src/client/api.ts` (`WordPressClient`) composes per-resource operation classes
-(`src/client/operations/`) via constructor injection; App Passwords, JWT, Basic, and API Key are configurable via
-`.env`/`mcp-wordpress.config.json` — Cookie auth is also implemented but is client/programmatic-only (see
-Authentication below).
-**Tools**: Posts(6) Pages(6) Media(5) Users(6) Comments(7) Taxonomies(10) Site(3) Auth(6) Cache(4) Performance(6)
-SEO(11) System(1) = 71.
-**Key files**: `src/client/api.ts`, `src/server/ToolRegistry.ts`, `src/tools/`, `src/config/ServerConfiguration.ts`,
+**Core**: MCP Server (`src/index.ts`) registers 71 WordPress tools via `src/server/ToolRegistry.ts`. **Client**:
+`src/client/api.ts` (`WordPressClient`) composes per-resource operation classes (`src/client/operations/`) via
+constructor injection; App Passwords, JWT, Basic, and API Key are configurable via `.env`/`mcp-wordpress.config.json` —
+Cookie auth is also implemented but is client/programmatic-only (see Authentication below). **Tools**: Posts(6) Pages(6)
+Media(5) Users(6) Comments(7) Taxonomies(10) Site(3) Auth(6) Cache(4) Performance(6) SEO(11) System(1) = 71. **Key
+files**: `src/client/api.ts`, `src/server/ToolRegistry.ts`, `src/tools/`, `src/config/ServerConfiguration.ts`,
 `src/utils/logger.ts`.
 
 Full per-directory contracts live in the Child DOX Index below — read the applicable child doc before editing.
@@ -63,9 +62,9 @@ multi-site mode and fails startup loudly on invalid config (no silent fallback).
 
 ## Authentication
 
-**Configurable methods** (`.env`/`mcp-wordpress.config.json`): App Passwords (recommended), JWT, Basic, API Key.
-Cookie auth is implemented in the client but is client/programmatic-only — `ConfigurationSchema` rejects it as a
-configured method, so it isn't available via `.env` or the multi-site config file.
+**Configurable methods** (`.env`/`mcp-wordpress.config.json`): App Passwords (recommended), JWT, Basic, API Key. Cookie
+auth is implemented in the client but is client/programmatic-only — `ConfigurationSchema` rejects it as a configured
+method, so it isn't available via `.env` or the multi-site config file.
 
 **401 Fix**: `npm run fix:rest-auth` or add to `.htaccess`:
 
@@ -81,18 +80,44 @@ RewriteRule .* - [e=HTTP_AUTHORIZATION:%1]
 - Cache issues: `rm -rf cache/`
 - TypeScript: use `| undefined` for optional properties
 - ESLint: use `_` prefix for unused variables
+- Zed dotenv diagnostics: environment templates suppress ShellCheck `SC2034`, which is inapplicable to externally
+  consumed variables
 
 ## CI/CD Pipeline
 
-Conventional commits trigger semantic-release versioning (`docs`, `style`, `test`, `build`, `ci`, `chore` do **not**
-cut a release — see `.releaserc.json`). Publishing: NPM + Docker Hub + DXT packaging. Node versions tested: 20, 22,
-24 (LTS). Quality gates: all tests pass, security scans clean.
+Conventional commits trigger semantic-release versioning (`docs`, `style`, `test`, `build`, `ci`, `chore` do **not** cut
+a release — see `release.config.js`). Publishing: NPM + Docker Hub + DXT packaging. Node versions tested: 20, 22, 24
+(LTS). Quality gates: all tests pass, security scans clean.
 
 **Workflow architecture (known audit deviation)**: all `.github/workflows/` files are intentionally self-contained
 inline definitions, not thin callers to `docdyhr/.github` — the shared library has no matching reusable workflows for
 this stack. `main-ci.yml` (4-suite × Node-version matrix), `wordpress-compatibility.yml` (live WordPress API tests),
 `release.yml` (DXT + Docker Hub + npm in one pipeline), `docker-modern.yml`, `dependency-review.yml` are all
 project-specific by design. `/repo-audit` flags these as P1 — expected and accepted.
+
+**Production Docker image has no npm**: `Dockerfile`'s production stage removes the `node:22-alpine` base image's
+bundled npm CLI (`node_modules`, `npm`, `npx` binaries) entirely — the container's entrypoint only ever runs
+`node dist/index.js` (`CMD`/`HEALTHCHECK`), and `docs/DOCKER.md`'s documented `docker exec` usage only ever invokes
+`node` directly, so npm is never needed at runtime. Do not add a runtime code path (health check, `docker exec`
+instructions, `bin/*.js` scripts run inside the container) that shells out to `npm`/`npx` without restoring it first.
+This also means npm's own vendored dependencies (`tar`, `brace-expansion`, `picomatch`, `sigstore` — CVEs in npm's
+internals that `npm audit --omit=dev` never surfaces since they're not in this project's own dependency tree, but that
+periodically tripped the post-push Trivy HIGH/CRITICAL image-scan gate) are gone from the shipped image; `corepack` is a
+separate package and is unaffected.
+
+**`release.config.js`'s `changelogTitle` must byte-match Prettier's output**: `@semantic-release/changelog` only skips
+prepending a fresh `# Changelog` header when the live `CHANGELOG.md` already `startsWith()` the configured
+`changelogTitle` — a byte-exact check (`node_modules/@semantic-release/changelog/lib/prepare.js`). Prettier's
+`proseWrap: "always"` wraps the intro paragraph at a specific point; if `changelogTitle` wraps it differently, the check
+silently fails on every release and prepends a duplicate header, compounding on each subsequent release (hit in the
+3.3.29 release commit, fixed in #230). If `.prettierrc.json`'s `printWidth`/`proseWrap` or the intro text ever change,
+run `npx prettier --write CHANGELOG.md` and copy the new byte-exact header into `changelogTitle`.
+
+**`release.config.js` runs an inline `formatChangelog` prepare plugin** between `@semantic-release/changelog` and
+`@semantic-release/git` that reformats `CHANGELOG.md` with Prettier's JS API before the release commit — otherwise
+semantic-release writes raw conventional-changelog output (unwrapped lines, `*` bullets) straight to disk, which fails
+`format:check` on the very next release. This happened after 3.3.30 (patched by hand in #232); this plugin exists so it
+self-heals instead of needing another manual patch each time. If this plugin is ever removed, the failure mode returns.
 
 ## Development Workflow
 
@@ -125,8 +150,7 @@ Quality gates before a PR: `npm test && npm run lint && npm run security:scan &&
 2. Identify every file or folder you expect to touch
 3. Walk from the repository root to each target path
 4. Read every AGENTS.md found along each route
-5. If a parent AGENTS.md lists a child AGENTS.md whose scope contains the path, read that child and continue from
-   there
+5. If a parent AGENTS.md lists a child AGENTS.md whose scope contains the path, read that child and continue from there
 6. Use the nearest AGENTS.md as the local contract and parent docs for repo-wide rules
 7. If docs conflict, the closer doc controls local work details, but no child doc may weaken DOX
 
@@ -201,6 +225,8 @@ When the user requests a durable behavior change, record it here or in the relev
 
 ### Child DOX Index
 
-- `src/AGENTS.md` — source-wide TypeScript/ESLint conventions, composition-pattern DI, logger usage; indexes its own children
+- `.zed/AGENTS.md` — project-scoped Zed language associations for configuration templates and generated output
+- `src/AGENTS.md` — source-wide TypeScript/ESLint conventions, composition-pattern DI, logger usage; indexes its own
+  children
 - `tests/AGENTS.md` — Vitest configs, coverage thresholds, test-against-dist convention
 - `scripts/AGENTS.md` — 73 operational scripts (release, auth-fix, health, docker, CI helpers); flags destructive ones
